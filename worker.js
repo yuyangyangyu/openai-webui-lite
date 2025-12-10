@@ -1,0 +1,5187 @@
+const isDeno = typeof Deno !== 'undefined';
+const isCf =
+  !isDeno &&
+  typeof Request !== 'undefined' &&
+  typeof Request.prototype !== 'undefined';
+
+// 获取环境变量
+const SERVER_TYPE = isDeno ? 'DENO' : isCf ? 'CF' : 'VPS';
+function getEnv(key, env = {}) {
+  if (isDeno) {
+    return Deno.env.get(key) || '';
+  } else if (typeof process !== 'undefined' && process.env) {
+    // Node.js 环境
+    return process.env[key] || '';
+  } else {
+    // Cloudflare Workers环境，从传入的 env 对象获取
+    return env[key] || '';
+  }
+}
+
+// ⚠️注意: 仅当您有密码共享需求时才需要配置 SECRET_PASSWORD 和 API_KEYS 这两个环境变量! 否则您无需配置, 默认会使用WebUI填写的API Key进行请求
+// 这里是您和您的朋友共享的密码, 优先使用环境变量, 双竖线后可以直接硬编码(例如 'yijiaren.308' 免得去管理面板配置环境变量了, 但极不推荐这么做!)
+const SECRET_PASSWORD_DEFAULT = `yijiaren.${~~(Math.random() * 1000)}`;
+// 这里是您的API密钥清单, 多个时使用逗号分隔, 会轮询(随机)使用, 同样也是优先使用环境变量, 其次使用代码中硬写的值, 注意不要在公开代码仓库中提交密钥的明文信息, 谨防泄露!!
+const API_KEYS_DEFAULT = 'sk-xxxxx,sk-yyyyy';
+const MODEL_IDS_DEFAULT = 'gpt-5-pro,gpt-5,gpt-5-mini';
+const API_BASE_DEFAULT = 'https://api.openai.com';
+const DEMO_PASSWORD_DEFAULT = '';
+const DEMO_MAX_TIMES_PER_HOUR_DEFAULT = 15;
+const TITLE_DEFAULT = 'OpenAI Chat';
+
+// KV 存储适配器 - 兼容 Cloudflare Workers 和 Deno Deploy
+let kvStore = null;
+
+/**
+ * 初始化 KV 存储
+ * @param {Object} env - 环境变量对象（Cloudflare Workers 会传入）
+ */
+async function initKV(env = {}) {
+  if (isDeno) {
+    // Deno Deploy: 使用 Deno KV
+    try {
+      kvStore = await Deno.openKv();
+    } catch (error) {
+      console.error('Failed to open Deno KV:', error);
+      kvStore = null;
+    }
+  } else if (env.KV) {
+    // Cloudflare Workers: 使用绑定的 KV namespace
+    kvStore = env.KV;
+  } else {
+    // 没有 KV 存储，使用内存模拟（不推荐用于生产环境）
+    console.warn('KV storage not available, using in-memory fallback');
+    kvStore = null;
+  }
+  return kvStore;
+}
+
+/**
+ * 从 KV 存储获取值
+ * @param {string} key - 键名
+ * @returns {Promise<any>} - 返回解析后的 JSON 对象，如果不存在返回 null
+ */
+async function getKV(key) {
+  if (!kvStore) {
+    return null;
+  }
+
+  try {
+    if (isDeno) {
+      // Deno KV
+      const result = await kvStore.get([key]);
+      return result.value;
+    } else {
+      // Cloudflare Workers KV
+      const value = await kvStore.get(key, { type: 'json' });
+      return value;
+    }
+  } catch (error) {
+    console.error('KV get error:', error);
+    return null;
+  }
+}
+
+/**
+ * 向 KV 存储设置值
+ * @param {string} key - 键名
+ * @param {any} value - 要存储的值（会被序列化为 JSON）
+ * @param {number} ttl - 过期时间（秒），可选
+ * @returns {Promise<boolean>} - 成功返回 true
+ */
+async function setKV(key, value, ttl = null) {
+  if (!kvStore) {
+    return false;
+  }
+
+  try {
+    if (isDeno) {
+      // Deno KV
+      const options = ttl ? { expireIn: ttl * 1000 } : {};
+      await kvStore.set([key], value, options);
+      return true;
+    } else {
+      // Cloudflare Workers KV
+      const options = ttl ? { expirationTtl: ttl } : {};
+      await kvStore.put(key, JSON.stringify(value), options);
+      return true;
+    }
+  } catch (error) {
+    console.error('KV set error:', error);
+    return false;
+  }
+}
+
+// 临时演示密码记忆（仅作为 KV 不可用时的后备方案）
+const demoMemory = {
+  hour: 0,
+  times: 0,
+  maxTimes: DEMO_MAX_TIMES_PER_HOUR_DEFAULT
+};
+
+// API Key 轮询索引
+let apiKeyIndex = 0;
+
+// 通用的请求处理函数
+async function handleRequest(request, env = {}) {
+  // 初始化 KV 存储
+  await initKV(env);
+
+  // 从环境变量获取配置
+  const SECRET_PASSWORD =
+    getEnv('SECRET_PASSWORD', env) || SECRET_PASSWORD_DEFAULT;
+  const API_KEYS = getEnv('API_KEYS', env) || API_KEYS_DEFAULT;
+  const API_KEY_LIST = (API_KEYS || '')
+    .split(',')
+    .map(i => i.trim())
+    .filter(i => i);
+  const MODEL_IDS = getEnv('MODEL_IDS', env) || MODEL_IDS_DEFAULT;
+  const API_BASE = (getEnv('API_BASE', env) || API_BASE_DEFAULT).replace(
+    /\/$/,
+    ''
+  );
+  const DEMO_PASSWORD = getEnv('DEMO_PASSWORD', env) || DEMO_PASSWORD_DEFAULT;
+  const DEMO_MAX_TIMES =
+    parseInt(getEnv('DEMO_MAX_TIMES_PER_HOUR', env)) ||
+    DEMO_MAX_TIMES_PER_HOUR_DEFAULT;
+  const TAVILY_KEYS = getEnv('TAVILY_KEYS', env) || '';
+  const TAVILY_KEY_LIST = (TAVILY_KEYS || '')
+    .split(',')
+    .map(i => i.trim())
+    .filter(i => i);
+  const TITLE = getEnv('TITLE', env) || TITLE_DEFAULT;
+
+  let CHAT_TYPE = 'bot';
+  if (/openai/i.test(TITLE)) {
+    CHAT_TYPE = 'openai';
+  } else if (/gemini/i.test(TITLE)) {
+    CHAT_TYPE = 'gemini';
+  } else if (/claude/i.test(TITLE)) {
+    CHAT_TYPE = 'claude';
+  } else if (/qwen/i.test(TITLE)) {
+    CHAT_TYPE = 'qwen';
+  } else if (/deepseek/i.test(TITLE)) {
+    CHAT_TYPE = 'deepseek';
+  } else if (/router/i.test(TITLE)) {
+    CHAT_TYPE = 'router';
+  }
+
+  /**
+   * 检查并更新 demo 密码的调用次数
+   * @param {number} increment - 要增加的次数，默认为 1
+   * @returns {Promise<{allowed: boolean, message: string, data: object}>}
+   */
+  async function checkAndUpdateDemoCounter(increment = 1) {
+    const hour = Math.floor(Date.now() / 3600000);
+    const kvKey = 'demo_counter';
+
+    // 尝试从 KV 获取计数器数据
+    let demoData = await getKV(kvKey);
+
+    if (!demoData || demoData.hour !== hour) {
+      // KV 中没有数据或者已经过了一个小时，重置计数器
+      demoData = {
+        hour: hour,
+        times: 0,
+        maxTimes: DEMO_MAX_TIMES
+      };
+    }
+
+    // 检查是否超过最大调用次数
+    if (demoData.times >= demoData.maxTimes) {
+      return {
+        allowed: false,
+        message: `Exceeded maximum API calls (${demoData.maxTimes}) for this hour. Please try again next hour.`,
+        data: demoData
+      };
+    }
+
+    // 增加计数
+    demoData.times += increment;
+
+    // 保存到 KV（不设置过期时间，下次检查时会自动重置）
+    await setKV(kvKey, demoData);
+
+    // 如果 KV 存储失败，回退到内存记忆（仅当前实例有效）
+    if (!kvStore) {
+      if (demoMemory.hour === hour) {
+        if (demoMemory.times >= DEMO_MAX_TIMES) {
+          return {
+            allowed: false,
+            message: `Exceeded maximum API calls (${DEMO_MAX_TIMES}) for this hour`,
+            data: { hour, times: demoMemory.times, maxTimes: DEMO_MAX_TIMES }
+          };
+        }
+      } else {
+        demoMemory.hour = hour;
+        demoMemory.times = 0;
+      }
+      demoMemory.times += increment;
+    }
+
+    return {
+      allowed: true,
+      message: 'OK',
+      data: demoData
+    };
+  }
+
+  /**
+   * 验证并处理 API Key
+   * @param {string} apiKey - 原始 API Key
+   * @param {number} demoIncrement - Demo 密码的计数增量，默认为 1
+   * @returns {Promise<{valid: boolean, apiKey: string, error?: Response}>}
+   */
+  async function validateAndProcessApiKey(apiKey, demoIncrement = 1) {
+    if (!apiKey) {
+      return {
+        valid: false,
+        apiKey: '',
+        error: createErrorResponse(
+          'Missing API key. Provide via ?key= parameter or Authorization header',
+          401
+        )
+      };
+    }
+
+    // 检查是否是共享密码
+    if (apiKey === SECRET_PASSWORD) {
+      return {
+        valid: true,
+        apiKey: getNextApiKey(API_KEY_LIST)
+      };
+    }
+
+    // 检查是否是临时演示密码
+    if (apiKey === DEMO_PASSWORD && DEMO_PASSWORD) {
+      const result = await checkAndUpdateDemoCounter(demoIncrement);
+      if (!result.allowed) {
+        return {
+          valid: false,
+          apiKey: '',
+          error: createErrorResponse(result.message, 429)
+        };
+      }
+      return {
+        valid: true,
+        apiKey: getNextApiKey(API_KEY_LIST)
+      };
+    }
+
+    // 不是两类密码的情况下,如果传入的apiKey长度少于10位,认为是无效的密码(因为一般情况下各类系统的API Key不会短于这个长度)
+    if (apiKey.length <= 10) {
+      return {
+        valid: false,
+        apiKey: '',
+        error: createErrorResponse('Wrong password.', 401)
+      };
+    }
+
+    // 其他情况，使用原始 API Key
+    return {
+      valid: true,
+      apiKey: apiKey
+    };
+  }
+
+  const url = new URL(request.url);
+  const apiPath = url.pathname;
+  const apiMethod = request.method.toUpperCase();
+
+  // 处理HTML页面请求
+  if (apiPath === '/' || apiPath === '/index.html') {
+    const htmlContent = getHtmlContent(MODEL_IDS, TAVILY_KEYS, TITLE);
+    return new Response(htmlContent, {
+      headers: {
+        'Content-Type': 'text/html;charset=UTF-8',
+        'Cache-Control': 'public, max-age=14400' // 缓存4小时
+      }
+    });
+  }
+
+  if (apiPath === '/favicon.svg') {
+    const svgContent = getSvgContent(CHAT_TYPE);
+    return new Response(svgContent, {
+      headers: {
+        'Content-Type': 'image/svg+xml',
+        'Cache-Control': 'public, max-age=43200' // 缓存12小时
+      }
+    });
+  }
+
+  if (apiPath === '/manifest.json' || apiPath === '/site.webmanifest') {
+    const manifestContent = getManifestContent(TITLE);
+    return new Response(manifestContent, {
+      headers: {
+        'Content-Type': 'application/json;charset=UTF-8',
+        'Cache-Control': 'public, max-age=43200' // 缓存12小时
+      }
+    });
+  }
+
+  // 直接返回客户端的原本的请求信息(用于调试)
+  if (apiPath === '/whoami') {
+    return new Response(
+      JSON.stringify({
+        serverType: SERVER_TYPE,
+        serverInfo: isDeno
+          ? {
+              target: Deno.build.target,
+              os: Deno.build.os,
+              arch: Deno.build.arch,
+              vendor: Deno.build.vendor
+            }
+          : request.cf || 'unknown',
+        url: request.url,
+        headers: Object.fromEntries(request.headers.entries()),
+        method: request.method,
+        bodyUsed: request.bodyUsed
+      }),
+      {
+        headers: { 'Content-Type': 'application/json' }
+      }
+    );
+  }
+
+  // 调用tavily搜索API
+  if (apiPath === '/search' && apiMethod === 'POST') {
+    let apiKey =
+      url.searchParams.get('key') || request.headers.get('Authorization') || '';
+    apiKey = apiKey.replace('Bearer ', '').trim();
+    // 从body中获取query参数
+    const query = (await request.json()).query || '';
+    if (!query) {
+      return createErrorResponse('Missing query parameter', 400);
+    }
+
+    const keyValidation = await validateAndProcessApiKey(apiKey, 0.1);
+    if (!keyValidation.valid) {
+      return keyValidation.error;
+    }
+
+    const modelPrompt = getTavilyPrompt(query);
+    const model = getLiteModelId(MODEL_IDS);
+    let modelUrl = `${API_BASE}/v1/chat/completions`;
+    modelUrl = replaceApiUrl(modelUrl);
+    const modelPayload = {
+      model,
+      messages: [
+        {
+          role: 'user',
+          content: modelPrompt.trim()
+        }
+      ]
+    };
+    let modelResponse;
+    try {
+      modelResponse = await doWithTimeout(
+        fetch(modelUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: 'Bearer ' + getNextApiKey(API_KEY_LIST)
+          },
+          body: JSON.stringify(modelPayload)
+        }),
+        30000 // 30秒超时
+      );
+    } catch (error) {
+      console.error('Search tavily failed:', error);
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+    }
+    // 接下来从modelResponse中提取content
+    const modelJsonData = await modelResponse.json();
+    const content = modelJsonData.choices?.[0]?.message?.content || '';
+    // 从中找到反引号`的位置, 提取反引号里包裹的内容
+    // 从结果中找到花括号内容, 提取为JSON
+    const jsonMatch = content.replace(/\n/g, '').match(/({.*})/);
+    let searchJson = jsonMatch ? jsonMatch[1].trim() : content;
+    try {
+      searchJson = JSON.parse(searchJson);
+    } catch (e) {
+      searchJson = null;
+    }
+    if (!searchJson || searchJson.num_results === 0) {
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+    }
+
+    // 并发请求所有搜索关键词
+    const searchPromises = searchJson.search_queries.map(
+      async searchKeyword => {
+        const tavilyUrl = 'https://api.tavily.com/search';
+        const tavilyKey = getRandomApiKey(TAVILY_KEY_LIST);
+        const payload = {
+          query: searchKeyword,
+          max_results: searchJson.num_results,
+          include_answer: 'basic',
+          auto_parameters: true,
+          exclude_domains: [
+            // 此处排除:带有明显zz色彩/偏见的网站,确保搜索结果不混入其内容
+            // 不可解释
+            'ntdtv.com',
+            'ntd.tv',
+            'aboluowang.com',
+            'epochtimes.com',
+            'epochtimes.jp',
+            'dafahao.com',
+            'minghui.org',
+
+            // 其他强烈偏见性媒体
+            'secretchina.com',
+            'kanzhongguo.com',
+            'soundofhope.org',
+            'rfa.org',
+            'bannedbook.org',
+            'boxun.com',
+            'peacehall.com',
+            'creaders.net',
+            'backchina.com',
+
+            // 其他方向的偏见性媒体
+            'guancha.cn', // 观察者网（强烈民族主义倾向）
+            'wenxuecity.com', // 文学城（部分内容质量参差）
+
+            // 阴谋论和伪科学网站
+            'awaker.cn',
+            'tuidang.org',
+
+            // === 英文媒体 ===
+            // 极右翼/阴谋论
+            'breitbart.com', // Breitbart News（已被维基百科弃用）
+            'infowars.com', // InfoWars（阴谋论）
+            'naturalnews.com', // Natural News（伪科学）
+            'globalresearch.ca', // Global Research（阴谋论，维基百科黑名单）
+            'zerohedge.com', // Zero Hedge（极端金融偏见）
+            'thegatewaypu<wbr>ndit.com', // Gateway Pundit（虚假新闻）
+            'newsmax.com', // Newsmax（强烈保守派偏见）
+            'oann.com', // One America News（虚假信息）
+            'dailywire.com', // Daily Wire（强烈保守派）
+            'theblaze.com', // The Blaze（维基百科认定不可靠）
+            'redstate.com', // RedState（党派性强）
+            'thenationalpulse.com', // National Pulse（极右翼）
+            'thefederalist.com', // The Federalist（强烈保守派）
+
+            // 极左翼
+            'dailykos.com', // Daily Kos（维基百科建议避免）
+            'alternet.org', // AlterNet（维基百科认定不可靠）
+            'commondreams.org', // Common Dreams（强烈左翼）
+            'thecanary.co', // The Canary（维基百科认定不可靠）
+            'occupy<wbr>democrats.com', // Occupy Democrats（党派性强）
+            'truthout.org', // Truthout（强烈左翼）
+
+            // 小报和低质量新闻
+            'dailymail.co.uk', // Daily Mail（维基百科弃用）
+            'thesun.co.uk', // The Sun（小报）
+            'nypost.com', // New York Post（质量参差）
+            'express.co.uk', // Daily Express（维基百科认定不可靠）
+            'mirror.co.uk', // Daily Mirror（小报）
+            'dailystar.co.uk', // Daily Star（小报）
+
+            // 讽刺/虚假新闻网站
+            'theonion.com', // The Onion（讽刺网站）
+            'clickhole.com', // ClickHole（讽刺）
+            'babylonbee.com', // Babylon Bee（讽刺）
+            'newspunch.com', // News Punch/Your News Wire（虚假新闻）
+            'beforeitsnews.com', // Before It's News（阴谋论）
+
+            // 俄罗斯国家媒体
+            'rt.com', // RT（Russia Today）
+            'sputniknews.com', // Sputnik News
+            'tass.com', // TASS（需谨慎）
+
+            // 其他问题网站
+            'wikileaks.org', // WikiLeaks（主要来源，需谨慎）
+            'mediabiasfactcheck.com', // Media Bias Fact Check（维基百科不建议引用）
+            'allsides.com' // AllSides（维基百科认为不可靠）
+          ]
+        };
+
+        try {
+          const response = await fetch(tavilyUrl, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: 'Bearer ' + tavilyKey
+            },
+            body: JSON.stringify(payload)
+          });
+
+          if (!response.ok) {
+            console.error(
+              `Tavily API request failed for "${searchKeyword}":`,
+              response.status
+            );
+            return null;
+          }
+
+          return await response.json();
+        } catch (error) {
+          console.error(
+            `Error fetching Tavily results for "${searchKeyword}":`,
+            error
+          );
+          return null;
+        }
+      }
+    );
+
+    // 等待所有请求完成
+    const searchResults = await Promise.all(searchPromises);
+
+    // 过滤掉失败的请求，合并结果
+    const validResults = searchResults.filter(result => result !== null);
+
+    return new Response(JSON.stringify(validResults), {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
+  }
+
+  // 总结会话
+  if (apiPath === '/summarize' && apiMethod === 'POST') {
+    let apiKey =
+      url.searchParams.get('key') || request.headers.get('Authorization') || '';
+    apiKey = apiKey.replace('Bearer ', '').trim();
+
+    // 从body中获取question和answer参数
+    const { question, answer } = await request.json();
+    if (!question || !answer) {
+      return createErrorResponse('Missing question or answer parameter', 400);
+    }
+
+    const keyValidation = await validateAndProcessApiKey(apiKey, 0.1);
+    if (!keyValidation.valid) {
+      return keyValidation.error;
+    }
+
+    // 检查是否是有效的密码（SECRET_PASSWORD 或 DEMO_PASSWORD）
+    if (![DEMO_PASSWORD, SECRET_PASSWORD].includes(apiKey)) {
+      return createErrorResponse('Invalid API key. Provide a valid key.', 403);
+    }
+
+    // 截取question和answer，避免过长
+    const truncatedQuestion =
+      question.length <= 300
+        ? question
+        : question.slice(0, 150) + '......' + question.slice(-150);
+    const truncatedAnswer =
+      answer.length <= 300
+        ? answer
+        : answer.slice(0, 150) + '......' + answer.slice(-150);
+
+    // 构建总结提示词
+    const summaryPrompt = `请为以下对话生成一个简短的标题（不超过20个字）：
+
+问题：
+\`\`\`
+${truncatedQuestion}
+\`\`\`
+
+回答：
+\`\`\`
+${truncatedAnswer}
+\`\`\`
+
+要求：
+1. 标题要简洁明了，能概括对话的核心内容
+2. 不要使用引号或其他标点符号包裹
+3. 直接输出标题文本即可`;
+
+    const messages = [
+      {
+        role: 'user',
+        content: summaryPrompt
+      }
+    ];
+
+    // 选择合适的精简模型
+    const summaryModel = getLiteModelId(MODEL_IDS);
+    let modelUrl = `${API_BASE}/v1/chat/completions`;
+    modelUrl = replaceApiUrl(modelUrl);
+
+    const modelPayload = {
+      model: summaryModel,
+      messages: messages,
+      max_tokens: 300
+    };
+
+    try {
+      const modelResponse = await fetch(modelUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer ' + getNextApiKey(API_KEY_LIST)
+        },
+        body: JSON.stringify(modelPayload)
+      });
+
+      if (!modelResponse.ok) {
+        throw new Error('Model API request failed');
+      }
+
+      const modelJsonData = await modelResponse.json();
+      const summary = modelJsonData.choices?.[0]?.message?.content || '';
+
+      return new Response(
+        JSON.stringify({
+          success: true,
+          summary: summary.trim()
+        }),
+        {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+    } catch (error) {
+      console.error('Generate summary failed:', error);
+      return createErrorResponse('Failed to generate summary', 500);
+    }
+  }
+
+  if (!apiPath.startsWith('/v1')) {
+    return createErrorResponse(
+      apiPath + ' Invalid API path. Must start with /v1',
+      400
+    );
+  }
+
+  // 2. 获取和验证API密钥
+  let apiKey =
+    url.searchParams.get('key') || request.headers.get('Authorization') || '';
+  apiKey = apiKey.replace('Bearer ', '').trim();
+  let urlSearch = url.searchParams.toString();
+
+  const originalApiKey = apiKey;
+  const keyValidation = await validateAndProcessApiKey(apiKey);
+  if (!keyValidation.valid) {
+    return keyValidation.error;
+  }
+
+  apiKey = keyValidation.apiKey;
+
+  // 替换 URL 中的密码为实际 API Key
+  if (originalApiKey === SECRET_PASSWORD) {
+    urlSearch = urlSearch.replace(`key=${SECRET_PASSWORD}`, `key=${apiKey}`);
+  } else if (originalApiKey === DEMO_PASSWORD) {
+    urlSearch = urlSearch.replace(`key=${DEMO_PASSWORD}`, `key=${apiKey}`);
+  }
+
+  // 3. 构建请求
+  let fullPath = `${API_BASE}${apiPath}`;
+  fullPath = replaceApiUrl(fullPath);
+  const targetUrl = `${fullPath}?${urlSearch}`;
+  const proxyRequest = buildProxyRequest(request, apiKey);
+
+  // 4. 发起请求并处理响应
+  try {
+    const response = await fetch(targetUrl, proxyRequest);
+
+    // 直接透传响应 - 无缓冲流式处理
+    return new Response(response.body, {
+      status: response.status,
+      headers: response.headers
+    });
+  } catch (error) {
+    console.error('Proxy request failed:', error);
+    return createErrorResponse('Proxy request failed', 502);
+  }
+}
+
+// Cloudflare Workers 导出
+export default {
+  async fetch(request, env) {
+    return handleRequest(request, env);
+  }
+};
+
+// // Deno Deploy 支持
+// if (isDeno) {
+//   Deno.serve(handleRequest);
+// }
+
+/**
+ * 构建代理请求配置
+ */
+function buildProxyRequest(originalRequest, apiKey) {
+  const headers = new Headers();
+
+  // 复制必要的请求头
+  const headersToForward = [
+    'content-type',
+    'accept',
+    'accept-encoding',
+    'user-agent'
+  ];
+
+  headersToForward.forEach(headerName => {
+    const value = originalRequest.headers.get(headerName);
+    if (value) {
+      headers.set(headerName, value);
+    }
+  });
+
+  // 设置API密钥
+  headers.set('Authorization', `Bearer ${apiKey}`);
+
+  return {
+    method: originalRequest.method,
+    headers: headers,
+    body: originalRequest.body,
+    redirect: 'follow'
+  };
+}
+
+/**
+ * 创建错误响应
+ */
+function createErrorResponse(message, status) {
+  return new Response(
+    JSON.stringify({
+      error: message,
+      timestamp: new Date().toISOString()
+    }),
+    {
+      status: status,
+      headers: { 'Content-Type': 'application/json' }
+    }
+  );
+}
+
+/**
+ * 为 Promise 添加超时控制
+ * @param {Promise} promise - 需要执行的 Promise
+ * @param {number} timeout - 超时时间（毫秒）
+ * @returns {Promise} 返回一个带超时控制的 Promise
+ */
+function doWithTimeout(promise, timeout) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`请求超时（${timeout}ms）`)), timeout)
+    )
+  ]);
+}
+
+/**
+ * 轮询获取下一个 API Key
+ * 使用递增索引方式，避免同一时间多个请求使用同一个 Key
+ */
+function getNextApiKey(apiKeyList) {
+  if (!apiKeyList || apiKeyList.length === 0) {
+    throw new Error('API Key list is empty');
+  }
+  const key = apiKeyList[apiKeyIndex % apiKeyList.length];
+  apiKeyIndex = (apiKeyIndex + 1) % apiKeyList.length;
+  return key;
+}
+
+function getRandomApiKey(apiKeyList) {
+  if (!apiKeyList || apiKeyList.length === 0) {
+    throw new Error('API Key list is empty');
+  }
+  const randomIndex = Math.floor(Math.random() * apiKeyList.length);
+  return apiKeyList[randomIndex];
+}
+
+function getLiteModelId(modelIds) {
+  if (!modelIds) return 'gemini-2.5-flash-lite';
+  const models = modelIds
+    .split(',')
+    .filter(i => i)
+    .map(i => i.split('=')[0].trim())
+    .filter(i => i);
+  const parts = [
+    '-mini',
+    '-nano',
+    '-flash',
+    '-lite',
+    '-instruct',
+    '-fast',
+    '-dash',
+    '-alpha',
+    '-haiku',
+    '-4o',
+    '-v3',
+    '-k2',
+    '-r1',
+    '-air',
+    'gpt'
+  ];
+  let model = models[0];
+  for (const p of parts) {
+    const match = models.find(m => m.toLowerCase().includes(p));
+    if (match) {
+      model = match;
+      break;
+    }
+  }
+  return model;
+}
+
+function replaceApiUrl(url) {
+  const isGemini = [
+    'generativelanguage.googleapis.com',
+    'gateway.ai.cloudflare.com'
+  ].some(p => url.includes(p));
+  if (!isGemini) {
+    return url;
+  } else {
+    url = url
+      .replace('/v1/chat', '/v1beta/openai/chat')
+      .replace('/v1/models', '/v1beta/openai/models');
+    return url;
+  }
+}
+
+function getTavilyPrompt(query) {
+  const str = `
+你是一位AI聊天应用的前置助手（search-helper），专为调用Tavily搜索引擎API服务。你的核心职责是从用户的自然语言问句中，精准、高效地分析查询意图，并生成最适合的搜索策略。
+
+## 核心使命
+你的存在是为了提升搜索引擎的调用效率和准确率。通过智能分析用户问题的复杂度、信息需求和最优搜索策略，你将直接优化用户的搜索体验并提供更相关的结果。
+
+## 任务要求
+1.  **意图识别：** 首先判断用户输入是否需要实时信息检索。
+    - **需要搜索**：时事新闻、实时数据、专业资料、产品信息、学术研究等
+    - **无需搜索**：上下文严重缺失（指代不清）、日常问候、情感交流、基本常识、简单计算、短文写作、纯逻辑推理等已有知识库覆盖内容
+2.  **复杂度评估：** 若需要搜索，判断问题的复杂程度：
+    - **简单问题**：单一明确的信息点（如"今日天气"、"某公司股价"）
+    - **复杂问题**：多维度信息需求（如"分析某行业发展趋势及面临挑战"）
+3.  **搜索策略制定：** 
+    - **简单问题**：生成1个精准关键词，建议返回5-10条结果
+    - **复杂问题**：拆解为2-3个搜索任务，每个任务覆盖问题的一个核心维度，建议返回15-20条结果
+4.  **语言智能选择：** 根据信息源特征选择最优搜索语言
+5.  **格式化输出：** 严格按照JSON格式输出，不包含任何解释文字
+
+## 🌐 语言选择策略
+根据查询内容的**信息源特征**智能选择关键词语言：
+
+### 使用英文关键词的场景：
+- **国际财经资讯**：美股、欧股、国际油价、外汇、加密货币、国际大宗商品
+- **国际科技动态**：硅谷科技公司、开源项目、国际学术论文、前沿技术
+- **国际体育赛事**：NBA、英超、欧冠、温网、世界杯
+- **国际娱乐资讯**：好莱坞、格莱美、奥斯卡、Billboard榜单
+- **专业学术领域**：医学研究、物理学、化学、计算机科学（优质文献多为英文）
+- **国际政治事件**：联合国、G7峰会、北约等国际组织
+- **全球品牌动态**：Apple、Microsoft、Tesla、Meta等国际公司
+
+### 使用中文关键词的场景：
+- **中国本土资讯**：A股、港股、人民币、中国房地产、国内政策
+- **中文娱乐圈**：华语电影、内地综艺、港台明星、国内音乐榜单
+- **中国体育**：CBA、中超、国乒、中国女排
+- **地方性事件**：特定城市新闻、地方政策、区域经济
+- **中文互联网**：微博热搜、B站、小红书、抖音等平台内容
+- **中国传统文化**：中医、武术、书法、戏曲、节气
+
+### 判断要点：
+1. **信息源地域性**：优质信息主要来自哪个语言区域？
+2. **专业术语习惯**：该领域国际通用语言是什么？
+3. **时效性考量**：哪种语言能更快获取最新信息？
+
+## 关键词生成原则
+1.  **简洁至上**：使用最少的词语表达最核心的意图
+2.  **核心优先**：优先提取代表核心主题的名词或实体
+3.  **移除停用词**：省略口语化填充词、疑问词和无实际意义的助词
+4.  **处理歧义**：结合上下文选择最有可能的解释
+5.  **维度拆解**：复杂问题应拆解为多个独立的搜索维度
+
+## 输出格式规范
+
+你的输出应是一个JSON对象，包含以下两个键：
+
+1.  **search_queries**：字符串数组，包含1个或 **至多3个** Tavily搜索关键词
+    - **复杂问题**：生成2-3个搜索关键词，覆盖问题的不同维度
+    - **简单问题**：生成1个精准搜索关键词
+    - **非搜索意图**：返回空数组 \`[]\`
+
+2.  **num_results**：整数，表示建议返回的搜索结果数量
+    - **复杂问题**：建议15-20条结果
+    - **简单问题**：建议5-10条结果
+    - **非搜索意图**：设为0
+
+## 示例
+
+### 示例1：复杂问题（多维度搜索）
+**用户输入：** "分析一下人工智能在医疗健康领域的最新进展和面临的挑战"
+**你的输出：**
+\`\`\`json
+{
+  "search_queries": [
+    "AI healthcare recent breakthroughs 2024",
+    "challenges AI medical diagnosis implementation",
+    "AI drug discovery clinical trials"
+  ],
+  "num_results": 20
+}
+\`\`\`
+
+### 示例2：简单问题（单一信息点）
+**用户输入：** "10月30日美股收盘情况"
+**你的输出：**
+\`\`\`json
+{
+  "search_queries": [
+    "US stock market October 30 closing"
+  ],
+  "num_results": 5
+}
+\`\`\`
+
+### 示例3：复杂问题（中文场景）
+**用户输入：** "比较一下今年A股和美股的表现，分析背后的原因"
+**你的输出：**
+\`\`\`json
+{
+  "search_queries": [
+    "A股 2024 年度表现 分析",
+    "US stock market 2024 performance analysis",
+    "A股 美股 对比 影响因素"
+  ],
+  "num_results": 18
+}
+\`\`\`
+
+### 示例4：简单问题（中文场景）
+**用户输入：** "上海今天的天气"
+**你的输出：**
+\`\`\`json
+{
+  "search_queries": [
+    "上海 今天 天气"
+  ],
+  "num_results": 5
+}
+\`\`\`
+
+### 示例5：非搜索意图（上下文缺失、指代不清）
+**用户输入：** "翻译附图中的文字"
+**你的输出：**
+\`\`\`json
+{
+  "search_queries": [],
+  "num_results": 0
+}
+\`\`\`
+
+### 示例6：非搜索意图（问候）
+**用户输入：** "你好呀！"
+**你的输出：**
+\`\`\`json
+{
+  "search_queries": [],
+  "num_results": 0
+}
+\`\`\`
+
+### 示例7：非搜索意图（基本常识 OR 已有知识库覆盖内容）
+**用户输入：** "1+1等于几？" OR "Python怎样定义函数？"
+**你的输出：**
+\`\`\`json
+{
+  "search_queries": [],
+  "num_results": 0
+}
+\`\`\`
+
+### 示例8：非搜索意图（短文写作）
+**用户输入：** "帮我写一段关于友谊的句子"
+**你的输出：**
+\`\`\`json
+{
+  "search_queries": [],
+  "num_results": 0
+}
+\`\`\`
+
+### 示例9：中等复杂度问题
+**用户输入：** "OpenAI最新发布的模型有什么特点？"
+**你的输出：**
+\`\`\`json
+{
+  "search_queries": [
+    "OpenAI latest model release features",
+    "OpenAI new model performance comparison"
+  ],
+  "num_results": 12
+}
+\`\`\`
+
+## 时间校准
+现在真实世界的时间是${new Date().toISOString()}。
+
+## 用户输入
+\`\`\`
+${query}
+\`\`\`
+
+---
+
+请严格按照JSON格式输出，不要添加任何其他文字说明。
+  `;
+  return str.trim();
+}
+
+function getSvgContent(chatType) {
+  const svgOpenai = `
+<svg
+  t="1761563068979"
+  class="icon"
+  viewBox="0 0 1024 1024"
+  version="1.1"
+  xmlns="http://www.w3.org/2000/svg"
+  p-id="2192"
+  width="24"
+  height="24"
+>
+  <rect width="1024" height="1024" fill="white" />
+  <path
+    d="M0 512a512 512 0 1 0 1024 0 512 512 0 0 0-1024 0z"
+    fill="#F86AA4"
+    p-id="2193"
+  ></path>
+  <path
+    d="M845.585067 442.299733a189.303467 189.303467 0 0 0-16.725334-157.149866c-42.496-72.977067-127.829333-110.421333-211.217066-92.808534a198.417067 198.417067 0 0 0-186.948267-60.142933A195.857067 195.857067 0 0 0 284.330667 261.768533a194.013867 194.013867 0 0 0-129.706667 92.808534 191.453867 191.453867 0 0 0 24.064 227.089066 189.064533 189.064533 0 0 0 16.554667 157.149867c42.530133 72.977067 127.965867 110.455467 211.387733 92.808533a195.345067 195.345067 0 0 0 146.261333 64.375467c85.435733 0.1024 161.109333-54.340267 187.255467-134.621867a194.1504 194.1504 0 0 0 129.672533-92.7744 191.761067 191.761067 0 0 0-24.234666-226.304z m-292.693334 403.456a146.432 146.432 0 0 1-93.320533-33.28l4.608-2.56 154.999467-88.302933a25.3952 25.3952 0 0 0 12.731733-21.742933v-215.586134l65.536 37.376a2.218667 2.218667 0 0 1 1.262933 1.6384v178.653867c-0.2048 79.36-65.365333 143.633067-145.8176 143.803733zM239.479467 713.728a141.380267 141.380267 0 0 1-17.3056-96.426667l4.608 2.696534 155.136 88.302933a25.4976 25.4976 0 0 0 25.2928 0l189.576533-107.793067v74.615467a2.525867 2.525867 0 0 1-1.058133 1.9456l-157.013334 89.326933c-69.768533 39.594667-158.890667 16.042667-199.236266-52.667733zM198.656 380.689067a145.066667 145.066667 0 0 1 76.8-63.146667v181.6576a24.439467 24.439467 0 0 0 12.526933 21.640533l188.689067 107.349334-65.536 37.376a2.4576 2.4576 0 0 1-2.321067 0l-156.672-89.1904a143.0528 143.0528 0 0 1-53.486933-196.471467v0.785067z m538.453333 123.323733l-189.2352-108.373333 65.365334-37.205334a2.4576 2.4576 0 0 1 2.321066 0l156.672 89.258667a143.291733 143.291733 0 0 1 72.465067 136.533333 144.0768 144.0768 0 0 1-94.4128 122.88V525.312a25.258667 25.258667 0 0 0-13.2096-21.333333z m65.194667-96.699733l-4.573867-2.730667-154.862933-89.088a25.4976 25.4976 0 0 0-25.4976 0l-189.371733 107.861333v-74.683733a2.1504 2.1504 0 0 1 0.887466-1.911467l156.706134-89.1904a147.6608 147.6608 0 0 1 156.330666 6.724267 143.1552 143.1552 0 0 1 60.381867 142.404267v0.6144zM392.192 539.613867l-65.536-37.239467a2.525867 2.525867 0 0 1-1.262933-1.8432V322.389333a143.872 143.872 0 0 1 84.104533-130.116266 147.626667 147.626667 0 0 1 155.170133 19.626666l-4.608 2.56-154.999466 88.2688a25.3952 25.3952 0 0 0-12.765867 21.742934l-0.136533 215.1424h0.034133z m35.566933-75.707734l84.411734-47.991466 84.5824 47.991466v96.017067l-84.2752 47.991467-84.548267-47.991467-0.170667-96.017067z"
+    fill="#FFFFFF"
+    p-id="2194"
+  ></path>
+</svg>
+`;
+  const svgGemini = `
+<svg
+  width="24"
+  height="24"
+  viewBox="0 0 32 32"
+  xmlns="http://www.w3.org/2000/svg"
+>
+  <title>Gemini</title>
+  
+  <!-- White circular background with safe area -->
+  <circle cx="16" cy="16" r="24" fill="#ffffff"/>
+  
+  <!-- Icon centered: scale first, then translate to center -->
+  <g transform="translate(16, 16) scale(1) translate(-12, -12)">
+    <path
+      d="M20.616 10.835a14.147 14.147 0 01-4.45-3.001 14.111 14.111 0 01-3.678-6.452.503.503 0 00-.975 0 14.134 14.134 0 01-3.679 6.452 14.155 14.155 0 01-4.45 3.001c-.65.28-1.318.505-2.002.678a.502.502 0 000 .975c.684.172 1.35.397 2.002.677a14.147 14.147 0 014.45 3.001 14.112 14.112 0 013.679 6.453.502.502 0 00.975 0c.172-.685.397-1.351.677-2.003a14.145 14.145 0 013.001-4.45 14.113 14.113 0 016.453-3.678.503.503 0 000-.975 13.245 13.245 0 01-2.003-.678z"
+      fill="#3186FF"
+    ></path>
+    <path
+      d="M20.616 10.835a14.147 14.147 0 01-4.45-3.001 14.111 14.111 0 01-3.678-6.452.503.503 0 00-.975 0 14.134 14.134 0 01-3.679 6.452 14.155 14.155 0 01-4.45 3.001c-.65.28-1.318.505-2.002.678a.502.502 0 000 .975c.684.172 1.35.397 2.002.677a14.147 14.147 0 014.45 3.001 14.112 14.112 0 013.679 6.453.502.502 0 00.975 0c.172-.685.397-1.351.677-2.003a14.145 14.145 0 013.001-4.45 14.113 14.113 0 016.453-3.678.503.503 0 000-.975 13.245 13.245 0 01-2.003-.678z"
+      fill="url(#lobe-icons-gemini-fill-0)"
+    ></path>
+    <path
+      d="M20.616 10.835a14.147 14.147 0 01-4.45-3.001 14.111 14.111 0 01-3.678-6.452.503.503 0 00-.975 0 14.134 14.134 0 01-3.679 6.452 14.155 14.155 0 01-4.45 3.001c-.65.28-1.318.505-2.002.678a.502.502 0 000 .975c.684.172 1.35.397 2.002.677a14.147 14.147 0 014.45 3.001 14.112 14.112 0 013.679 6.453.502.502 0 00.975 0c.172-.685.397-1.351.677-2.003a14.145 14.145 0 013.001-4.45 14.113 14.113 0 016.453-3.678.503.503 0 000-.975 13.245 13.245 0 01-2.003-.678z"
+      fill="url(#lobe-icons-gemini-fill-1)"
+    ></path>
+    <path
+      d="M20.616 10.835a14.147 14.147 0 01-4.45-3.001 14.111 14.111 0 01-3.678-6.452.503.503 0 00-.975 0 14.134 14.134 0 01-3.679 6.452 14.155 14.155 0 01-4.45 3.001c-.65.28-1.318.505-2.002.678a.502.502 0 000 .975c.684.172 1.35.397 2.002.677a14.147 14.147 0 014.45 3.001 14.112 14.112 0 013.679 6.453.502.502 0 00.975 0c.172-.685.397-1.351.677-2.003a14.145 14.145 0 013.001-4.45 14.113 14.113 0 016.453-3.678.503.503 0 000-.975 13.245 13.245 0 01-2.003-.678z"
+      fill="url(#lobe-icons-gemini-fill-2)"
+    ></path>
+  </g>
+  <defs>
+    <linearGradient
+      gradientUnits="userSpaceOnUse"
+      id="lobe-icons-gemini-fill-0"
+      x1="7"
+      x2="11"
+      y1="15.5"
+      y2="12"
+    >
+      <stop stop-color="#08B962"></stop>
+      <stop offset="1" stop-color="#08B962" stop-opacity="0"></stop>
+    </linearGradient>
+    <linearGradient
+      gradientUnits="userSpaceOnUse"
+      id="lobe-icons-gemini-fill-1"
+      x1="8"
+      x2="11.5"
+      y1="5.5"
+      y2="11"
+    >
+      <stop stop-color="#F94543"></stop>
+      <stop offset="1" stop-color="#F94543" stop-opacity="0"></stop>
+    </linearGradient>
+    <linearGradient
+      gradientUnits="userSpaceOnUse"
+      id="lobe-icons-gemini-fill-2"
+      x1="3.5"
+      x2="17.5"
+      y1="13.5"
+      y2="12"
+    >
+      <stop stop-color="#FABC12"></stop>
+      <stop offset=".46" stop-color="#FABC12" stop-opacity="0"></stop>
+    </linearGradient>
+  </defs>
+</svg>
+  `;
+  const svgClaude = `
+<svg
+  t="1761630730959"
+  class="icon"
+  viewBox="0 0 1024 1024"
+  version="1.1"
+  xmlns="http://www.w3.org/2000/svg"
+  p-id="6390"
+  width="24"
+  height="24"
+>
+  <rect width="1024" height="1024" fill="white" />
+  <path
+    d="M198.4 678.4l198.4-115.2 6.4-12.8H243.2l-96-6.4-102.4-6.4-19.2-6.4-25.6-25.6v-12.8l19.2-12.8h32l64 6.4 96 6.4 70.4 6.4L384 512h19.2V492.8l-6.4-6.4-102.4-64-108.8-76.8-51.2-38.4-32-19.2-19.2-25.6-6.4-38.4 32-32h44.8l38.4 32 83.2 64L384 364.8l12.8 12.8 6.4-6.4-6.4-12.8L339.2 256l-64-108.8-25.6-38.4-6.4-25.6c0-12.8-6.4-19.2-6.4-32l32-44.8 19.2-6.4 44.8 6.4 19.2 12.8 25.6 57.6 44.8 96 64 128 19.2 38.4 6.4 38.4 6.4 12.8h6.4V384l6.4-70.4 12.8-89.6 12.8-115.2 6.4-32 19.2-38.4 32-19.2 25.6 12.8 19.2 32v19.2l-32 70.4-19.2 121.6-19.2 83.2h6.4l12.8-12.8 44.8-57.6 70.4-89.6 32-32 38.4-38.4 25.6-19.2h44.8l32 51.2-12.8 51.2-51.2 57.6-38.4 51.2-51.2 70.4-38.4 57.6v6.4h6.4l121.6-25.6 64-12.8 76.8-12.8 38.4 19.2 6.4 19.2-12.8 32-83.2 19.2-96 19.2-147.2 32 64 6.4h96l128 6.4 32 19.2 25.6 38.4-6.4 19.2-51.2 25.6-70.4-12.8-160-38.4-57.6-12.8h-6.4v6.4l44.8 44.8 83.2 76.8 108.8 102.4 6.4 25.6-12.8 19.2h-12.8l-96-70.4-38.4-32-83.2-70.4h-6.4v6.4l19.2 25.6 102.4 147.2 6.4 44.8-6.4 12.8-25.6 6.4-25.6-6.4-57.6-83.2-64-83.2-51.2-83.2-6.4 6.4-25.6 307.2-12.8 12.8-32 12.8-25.6-19.2-12.8-32 12.8-64 19.2-83.2 12.8-64 12.8-83.2 6.4-25.6h-6.4l-64 83.2-96 128-70.4 76.8-19.2 6.4-32-12.8v-25.6l19.2-25.6 102.4-128 64-83.2 38.4-51.2v-6.4l-268.8 172.8-51.2 12.8-19.2-19.2v-32l12.8-12.8 76.8-57.6z m0 0"
+    fill="#D97757"
+    p-id="6391"
+  ></path>
+</svg>
+  `;
+  const svgQwen = `
+<svg
+  t="1761614247284"
+  class="icon"
+  viewBox="0 0 1024 1024"
+  version="1.1"
+  xmlns="http://www.w3.org/2000/svg"
+  p-id="5205"
+  width="24"
+  height="24"
+>
+  <rect width="1024" height="1024" fill="white" />
+  <path
+    d="M255.872 279.808h-109.76a21.12 21.12 0 0 0-18.288 10.528L66.816 396a21.168 21.168 0 0 0 0 21.12L317.12 850.144h121.68l180.768-151.84-363.68-418.496z"
+    fill="#615CED"
+    p-id="5206"
+  ></path>
+  <path
+    d="M182.72 617.76l-54.896 95.04a21.12 21.12 0 0 0 0 21.168l60.992 105.6c3.696 6.56 10.72 10.624 18.256 10.576h231.712L182.672 617.76h0.048z m658.608-211.28l54.848-95.024a21.12 21.12 0 0 0 0-21.152l-60.992-105.6a21.152 21.152 0 0 0-18.24-10.576l-500.208 0.224-60.864 105.36 41.12 232.544 544.336-105.824v0.048z"
+    fill="#615CED"
+    p-id="5207"
+  ></path>
+  <path
+    d="M585.12 174.16l-54.848-95.04A21.12 21.12 0 0 0 512 68.48h-122a20.976 20.976 0 0 0-18.256 10.624l-55.456 96.032-60.4 104.576 329.264-105.552z m-146.288 676.032l54.8 95.056a21.12 21.12 0 0 0 18.352 10.496h122a21.168 21.168 0 0 0 18.24-10.544l249.92-433.312-60.816-105.376-221.952-80.592-180.544 524.224v0.048z"
+    fill="#615CED"
+    p-id="5208"
+  ></path>
+  <path
+    d="M768.08 744.512h109.76a21.136 21.136 0 0 0 18.288-10.576l61.008-105.6a20.992 20.992 0 0 0 0-21.168l-55.456-96.032-60.4-104.624-73.2 338z"
+    fill="#615CED"
+    p-id="5209"
+  ></path>
+  <path
+    d="M452.416 828.656l-243.36 0.928 60.32-105.504 121.856-0.464L145.84 302.64l121.872-0.288L512.848 722.88l-60.448 105.728v0.048z"
+    fill="#FFFFFF"
+    p-id="5210"
+  ></path>
+  <path
+    d="M267.664 302.32l120.832-211.2 61.232 104.96-60.432 105.728 487.248-2-60.768 105.696-486.704 1.984-61.408-105.168z"
+    fill="#FFFFFF"
+    p-id="5211"
+  ></path>
+  <path
+    d="M815.824 405.44l122.464 210.272-121.504 0.512-61.312-105.216L513.6 933.984l-61.184-105.424 241.6-422.56 121.856-0.544h-0.048z"
+    fill="#FFFFFF"
+    p-id="5212"
+  ></path>
+  <path
+    d="M512.848 722.784l181.152-316.768-364.928 1.472 183.776 315.296z"
+    fill="#605BEC"
+    p-id="5213"
+  ></path>
+  <path
+    d="M512.848 722.784L267.712 302.272l12.112-21.12 245.12 420.528-12.08 21.152v-0.048z"
+    fill="#605BEC"
+    p-id="5214"
+  ></path>
+  <path
+    d="M329.072 407.584l486.752-2.032 12.24 21.024-486.752 2.032-12.24-21.024z"
+    fill="#605BEC"
+    p-id="5215"
+  ></path>
+  <path
+    d="M694.048 406.016l-241.6 422.512-24.304 0.08 241.6-422.512 24.32-0.08z"
+    fill="#605BEC"
+    p-id="5216"
+  ></path>
+</svg>
+  `;
+  const svgDeepseek = `
+<svg
+  t="1762144870999"
+  class="icon"
+  viewBox="0 0 1024 1024"
+  version="1.1"
+  xmlns="http://www.w3.org/2000/svg"
+  p-id="6244"
+  width="24"
+  height="24"
+>
+  <rect width="1024" height="1024" fill="white" />
+  <path
+    d="M550.4 486.4c0-8.533333 4.266667-12.8 12.8-12.8h4.266667c4.266667 0 4.266667 4.266667 4.266666 4.266667s4.266667 4.266667 4.266667 8.533333v4.266667s0 4.266667-4.266667 4.266666c0 0-4.266667 0-4.266666 4.266667h-4.266667-4.266667s-4.266667 0-4.266666-4.266667c0 0 0-4.266667-4.266667-4.266666v-4.266667z"
+    fill="#4D6BFE"
+    p-id="6245"
+  ></path>
+  <path
+    d="M994.133333 196.266667c-8.533333-4.266667-12.8 4.266667-21.333333 8.533333l-4.266667 4.266667c-12.8 17.066667-34.133333 25.6-55.466666 25.6-34.133333 0-59.733333 8.533333-85.333334 34.133333-4.266667-29.866667-21.333333-51.2-51.2-64-12.8-4.266667-29.866667-12.8-38.4-25.6-8.533333-8.533333-8.533333-21.333333-12.8-29.866667 0-4.266667 0-12.8-8.533333-12.8s-12.8 4.266667-12.8 12.8c-12.8 21.333333-21.333333 46.933333-17.066667 72.533334 0 59.733333 25.6 106.666667 72.533334 136.533333 4.266667 4.266667 8.533333 8.533333 4.266666 12.8-4.266667 12.8-8.533333 21.333333-8.533333 34.133333-4.266667 8.533333-4.266667 8.533333-12.8 4.266667-25.6-12.8-51.2-29.866667-68.266667-46.933333-34.133333-34.133333-64-72.533333-102.4-102.4-8.533333-8.533333-17.066667-12.8-25.6-21.333334-46.933333-34.133333 0-64 8.533334-68.266666 12.8-4.266667 4.266667-17.066667-29.866667-17.066667-34.133333 0-68.266667 12.8-106.666667 29.866667-8.533333 0-12.8 0-21.333333 4.266666-38.4-8.533333-76.8-8.533333-115.2-4.266666-76.8 8.533333-136.533333 42.666667-179.2 106.666666-51.2 76.8-64 157.866667-51.2 247.466667 17.066667 93.866667 64 170.666667 132.266667 230.4 72.533333 64 157.866667 93.866667 256 85.333333 59.733333-4.266667 123.733333-12.8 200.533333-76.8 17.066667 8.533333 38.4 12.8 72.533333 17.066667 25.6 4.266667 51.2 0 68.266667-4.266667 29.866667-4.266667 25.6-34.133333 17.066667-38.4-85.333333-42.666667-68.266667-25.6-85.333334-38.4 42.666667-51.2 110.933333-106.666667 136.533334-285.866666v-34.133334c0-8.533333 4.266667-8.533333 12.8-8.533333 21.333333-4.266667 42.666667-8.533333 59.733333-21.333333 55.466667-29.866667 76.8-81.066667 85.333333-145.066667 0-8.533333 0-17.066667-12.8-21.333333zM507.733333 746.666667c-85.333333-68.266667-123.733333-89.6-140.8-89.6-17.066667 0-12.8 21.333333-8.533333 29.866666 4.266667 12.8 8.533333 21.333333 12.8 29.866667 4.266667 8.533333 8.533333 17.066667-4.266667 25.6-25.6 17.066667-72.533333-4.266667-76.8-8.533333-55.466667-34.133333-98.133333-76.8-132.266666-136.533334-29.866667-51.2-46.933333-110.933333-46.933334-174.933333 0-17.066667 4.266667-21.333333 17.066667-25.6 21.333333-4.266667 42.666667-4.266667 59.733333 0 85.333333 12.8 157.866667 51.2 217.6 115.2 34.133333 34.133333 59.733333 76.8 89.6 119.466667 29.866667 42.666667 59.733333 85.333333 98.133334 119.466666 12.8 12.8 25.6 21.333333 34.133333 25.6-29.866667 0-81.066667 0-119.466667-29.866666z m166.4-196.266667c-8.533333 4.266667-17.066667 4.266667-25.6 4.266667-12.8 0-25.6-4.266667-29.866666-8.533334-12.8-8.533333-17.066667-12.8-21.333334-29.866666v-25.6c4.266667-12.8 0-21.333333-8.533333-29.866667-8.533333-4.266667-17.066667-8.533333-25.6-8.533333-4.266667 0-8.533333 0-8.533333-4.266667 0 0-4.266667 0-4.266667-4.266667v-4.266666-4.266667-4.266667c0-4.266667 8.533333-8.533333 8.533333-8.533333 12.8-8.533333 29.866667-4.266667 46.933334 0 12.8 4.266667 25.6 17.066667 38.4 29.866667 17.066667 17.066667 17.066667 25.6 25.6 38.4 8.533333 12.8 12.8 21.333333 17.066666 34.133333 0 12.8-4.266667 21.333333-12.8 25.6z"
+    fill="#4D6BFE"
+    p-id="6246"
+  ></path>
+</svg>
+  `;
+  const svgRouter = `
+<svg
+  t="1762765462742"
+  class="icon"
+  viewBox="0 0 1024 1024"
+  version="1.1"
+  xmlns="http://www.w3.org/2000/svg"
+  p-id="5158"
+  width="32"
+  height="32"
+>
+  <rect width="1024" height="1024" fill="white" />
+  <path d="M0 0h1024v1024H0V0z" fill="#94a3b8" p-id="5159"></path>
+  <path
+    d="M660.48 230.4c19.28192 7.71072 35.14368 15.2576 52.81792 25.66144l15.71328 9.21088 16.27136 9.61024 15.8464 9.30816c10.55744 6.1952 21.10464 12.40576 31.65184 18.61632A21568.34816 21568.34816 0 0 0 870.4 348.16c-16 17.6896-32.63488 28.28288-53.51936 39.68l-9.60512 5.2736c-10.0864 5.5296-20.20352 11.008-30.31552 16.4864l-20.14208 11.03872C725.00224 438.05184 693.0944 455.14752 660.48 471.04V409.6c-99.584 3.34848-159.7184 29.6448-240.7424 86.784A637.93152 637.93152 0 0 1 378.88 522.24c92.70272 69.43232 163.54304 110.19264 281.6 112.64v-61.44l38.912 21.22752c11.96032 6.52288 23.92576 13.03552 35.8912 19.54304 16.32256 8.87296 32.62464 17.78176 48.9216 26.70592 6.77376 3.70176 13.55776 7.39328 20.34688 11.07968 9.92256 5.38624 19.82976 10.81344 29.72672 16.24576l17.68448 9.64096C865.28 686.08 865.28 686.08 870.4 696.32l-11.71456 6.48192c-14.65856 8.1152-29.31712 16.23552-43.97056 24.36096l-18.85696 10.4448a24808.20736 24808.20736 0 0 0-36.61312 20.28544 1638.53824 1638.53824 0 0 0-44.81536 25.76384l-16.5888 9.92256-14.7456 8.97024C670.72 808.96 670.72 808.96 655.36 808.96v-51.2l-21.9392 0.90112c-101.34528 2.91328-170.89536-22.51776-254.32064-79.68256C310.26176 631.92064 255.29856 605.82912 174.08 583.68V460.8l35.84-7.68c65.13152-15.57504 119.78752-46.42304 173.33248-85.88288C471.35744 302.45376 551.936 282.75712 660.48 286.72V230.4z"
+    fill="#F8F8FE"
+    p-id="5160"
+  ></path>
+</svg>
+  `;
+  const svgDefault = `
+<svg
+  t="1763444006745"
+  class="icon"
+  viewBox="0 0 1024 1024"
+  version="1.1"
+  xmlns="http://www.w3.org/2000/svg"
+  p-id="28244"
+  width="32"
+  height="32"
+>
+  <rect width="1024" height="1024" fill="white" />
+  <path
+    d="M346.154667 72.96l4.010666 3.541333 128 128c2.730667 2.688 4.992 5.674667 6.826667 8.832h54.058667a42.453333 42.453333 0 0 1 3.242666-4.821333l3.541334-4.010667 128-128a42.666667 42.666667 0 0 1 63.872 56.32l-3.541334 4.010667L657.664 213.333333H725.333333a213.333333 213.333333 0 0 1 213.333334 213.333334v298.666666a213.333333 213.333333 0 0 1-213.333334 213.333334H298.666667a213.333333 213.333333 0 0 1-213.333334-213.333334v-298.666666a213.333333 213.333333 0 0 1 213.333334-213.333334h67.626666L289.834667 136.832a42.666667 42.666667 0 0 1 56.32-63.872zM725.333333 298.666667H298.666667a128 128 0 0 0-127.786667 120.490666L170.666667 426.666667v298.666666a128 128 0 0 0 120.490666 127.786667L298.666667 853.333333h426.666666a128 128 0 0 0 127.786667-120.490666L853.333333 725.333333v-298.666666a128 128 0 0 0-120.490666-127.786667L725.333333 298.666667zM384 405.333333a42.666667 42.666667 0 0 1 42.368 37.674667L426.666667 448v170.666667a42.666667 42.666667 0 0 1-85.034667 4.992L341.333333 618.666667v-170.666667a42.666667 42.666667 0 0 1 42.666667-42.666667z m307.498667 12.501334a42.666667 42.666667 0 0 1 3.541333 56.32l-3.541333 4.010666-55.125334 55.168 55.125334 55.168a42.666667 42.666667 0 0 1 3.541333 56.32l-3.541333 4.010667a42.666667 42.666667 0 0 1-56.32 3.541333l-4.010667-3.541333-85.333333-85.333333a42.666667 42.666667 0 0 1-3.541334-56.32l3.541334-4.010667 85.333333-85.333333a42.666667 42.666667 0 0 1 60.330667 0z"
+    fill="#1296db"
+    p-id="28245"
+  ></path>
+</svg>
+  `;
+  switch (chatType) {
+    case 'openai':
+      return svgOpenai;
+    case 'gemini':
+      return svgGemini;
+    case 'claude':
+      return svgClaude;
+    case 'qwen':
+      return svgQwen;
+    case 'deepseek':
+      return svgDeepseek;
+    case 'router':
+      return svgRouter;
+    default:
+      return svgDefault;
+  }
+}
+
+function getManifestContent(title) {
+  const str = `
+{
+  "name": "${title}",
+  "short_name": "${title}",
+  "description": "${title} - 智能对话助手",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#605bec",
+  "icons": [
+    {
+      "src": "favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["productivity", "utilities"],
+  "lang": "zh-CN",
+  "dir": "ltr"
+}
+  `;
+  return str.trim();
+}
+
+function getHtmlContent(modelIds, tavilyKeys, title) {
+  let html = `
+<!DOCTYPE html>
+<html lang="zh-Hans">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#605bec" />
+    <meta name="description" content="OpenAI Chat - 智能对话助手" />
+    <meta http-equiv="Content-Language" content="zh-CN" />
+    <title>OpenAI Chat</title>
+
+    <!-- Favicon -->
+    <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+
+    <!-- Web App Manifest -->
+    <link rel="manifest" href="site.webmanifest" />
+
+    <!-- iOS Safari -->
+    <link rel="apple-touch-icon" href="favicon.svg" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="OpenAI Chat" />
+
+    <script src="https://unpkg.com/tom-select@2.4.3/dist/js/tom-select.complete.min.js"></script>
+
+    <script src="https://unpkg.com/vue@3.5.22/dist/vue.global.prod.js"></script>
+    <script src="https://unpkg.com/sweetalert2@11.26.3/dist/sweetalert2.all.js"></script>
+    <script src="https://unpkg.com/marked@12.0.0/marked.min.js"></script>
+    <script src="https://unpkg.com/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+    <link
+      href="https://unpkg.com/tom-select@2.4.3/dist/css/tom-select.default.css"
+      rel="stylesheet"
+    />
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/github-markdown-css@5.8.1/github-markdown-light.css"
+    />
+    <script>
+      var isWechat = new RegExp('wechat', 'i').test(window.navigator.userAgent);
+      if (isWechat && document.title) {
+        document.title = '✨ ' + document.title;
+      }
+      // IndexedDB 封装
+      class OpenaiDB {
+        constructor() {
+          this.dbName = 'OpenaiChatDB';
+          this.version = 1;
+          this.storeName = 'chatData';
+          this.db = null;
+        }
+
+        async init() {
+          return new Promise((resolve, reject) => {
+            const request = indexedDB.open(this.dbName, this.version);
+
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => {
+              this.db = request.result;
+              resolve(this.db);
+            };
+
+            request.onupgradeneeded = event => {
+              const db = event.target.result;
+              if (!db.objectStoreNames.contains(this.storeName)) {
+                db.createObjectStore(this.storeName, { keyPath: 'key' });
+              }
+            };
+          });
+        }
+
+        async setItem(key, value) {
+          if (!this.db) await this.init();
+
+          return new Promise((resolve, reject) => {
+            const transaction = this.db.transaction(
+              [this.storeName],
+              'readwrite'
+            );
+            const store = transaction.objectStore(this.storeName);
+            const request = store.put({ key, value });
+
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => resolve();
+          });
+        }
+
+        async getItem(key) {
+          if (!this.db) await this.init();
+
+          return new Promise((resolve, reject) => {
+            const transaction = this.db.transaction(
+              [this.storeName],
+              'readonly'
+            );
+            const store = transaction.objectStore(this.storeName);
+            const request = store.get(key);
+
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => {
+              const result = request.result;
+              resolve(result ? result.value : null);
+            };
+          });
+        }
+
+        // 计算IndexedDB存储空间大小（MB）
+        async getTotalDataSize() {
+          if (!this.db) await this.init();
+
+          return new Promise((resolve, reject) => {
+            const transaction = this.db.transaction(
+              [this.storeName],
+              'readonly'
+            );
+            const store = transaction.objectStore(this.storeName);
+            const request = store.getAll();
+
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => {
+              const allData = request.result;
+              let totalSize = 0;
+
+              // 计算所有数据的JSON字符串大小
+              allData.forEach(item => {
+                const jsonString = JSON.stringify(item);
+                // 使用UTF-8编码计算字节数
+                totalSize += new Blob([jsonString]).size;
+              });
+
+              // 转换为MB
+              const sizeInMB = totalSize / (1024 * 1024);
+              resolve(sizeInMB);
+            };
+          });
+        }
+
+        // 获取存储空间统计信息
+        async getStorageStats() {
+          if (!this.db) await this.init();
+
+          const stats = {
+            totalSizeMB: 0,
+            itemCount: 0,
+            largestItemKey: '',
+            largestItemSizeMB: 0
+          };
+
+          return new Promise((resolve, reject) => {
+            const transaction = this.db.transaction(
+              [this.storeName],
+              'readonly'
+            );
+            const store = transaction.objectStore(this.storeName);
+            const request = store.getAll();
+
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => {
+              const allData = request.result;
+              let totalSize = 0;
+              let maxSize = 0;
+              let maxKey = '';
+
+              allData.forEach(item => {
+                const jsonString = JSON.stringify(item);
+                const itemSize = new Blob([jsonString]).size;
+                totalSize += itemSize;
+
+                if (itemSize > maxSize) {
+                  maxSize = itemSize;
+                  maxKey = item.key || 'unknown';
+                }
+              });
+
+              stats.totalSizeMB = totalSize / (1024 * 1024);
+              stats.itemCount = allData.length;
+              stats.largestItemKey = maxKey;
+              stats.largestItemSizeMB = maxSize / (1024 * 1024);
+
+              resolve(stats);
+            };
+          });
+        }
+      }
+
+      // 全局实例
+      window.openaiDB = new OpenaiDB();
+    </script>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      body {
+        position: relative;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+          sans-serif;
+        background: linear-gradient(135deg, #a8edea 0%, #fed6e3 100%);
+        min-height: 100vh;
+        min-height: 100dvh;
+        color: #333;
+      }
+
+      [v-cloak] {
+        display: none;
+      }
+
+      .hidden {
+        display: none !important;
+      }
+
+      /* 滚动条颜色浅一些 */
+      body.pc *::-webkit-scrollbar {
+        width: 10px;
+        background-color: #f5f6f7;
+      }
+
+      body.pc *::-webkit-scrollbar-thumb:hover {
+        background-color: #d1d5db;
+      }
+
+      body.pc *::-webkit-scrollbar-thumb {
+        background-color: #e5e7eb;
+        border-radius: 5px;
+      }
+
+      body.pc *::-webkit-scrollbar-track {
+        background-color: #f5f6f7;
+      }
+
+      button,
+      label {
+        user-select: none;
+      }
+
+      label * {
+        vertical-align: middle;
+      }
+
+      input::placeholder,
+      textarea::placeholder {
+        color: #a0aec0;
+        user-select: none;
+      }
+
+      .container {
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 20px;
+        height: 100vh;
+        display: flex;
+        gap: 20px;
+        transition: max-width 0.2s;
+      }
+
+      .container.wide {
+        max-width: 1600px;
+      }
+
+      .sidebar {
+        width: 300px;
+        background: rgba(255, 255, 255, 0.95);
+        border-radius: 15px;
+        padding: 20px;
+        backdrop-filter: blur(10px);
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+        display: flex;
+        flex-direction: column;
+      }
+
+      .sidebar.mobile {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100vh;
+        height: 100dvh;
+        z-index: 1000;
+        padding: 15px 20px;
+        transform: translateX(-100%);
+        transition: transform 0.3s ease;
+        backdrop-filter: blur(15px);
+        background: rgba(255, 255, 255, 0.98);
+        border-radius: 0;
+      }
+
+      .sidebar.mobile.show {
+        transform: translateX(0);
+      }
+
+      .sidebar-overlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100vh;
+        height: 100dvh;
+        background: rgba(0, 0, 0, 0.5);
+        z-index: 999;
+        opacity: 0;
+        visibility: hidden;
+        transition: all 0.3s ease;
+      }
+
+      .sidebar-overlay.show {
+        opacity: 1;
+        visibility: visible;
+      }
+
+      .mobile-menu-btn {
+        position: fixed;
+        top: 20px;
+        left: 20px;
+        width: 44px;
+        height: 44px;
+        background: rgba(255, 255, 255, 0.35);
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        cursor: pointer;
+        z-index: 1001;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 18px;
+        color: #4a5568;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+        transition: all 0.2s ease;
+      }
+
+      .mobile-menu-btn:hover {
+        /* background: #f7fafc; */
+        transform: scale(1.05);
+      }
+
+      .main-chat {
+        flex: 1 1 0;
+        background: rgba(255, 255, 255, 0.95);
+        border-radius: 15px;
+        backdrop-filter: blur(10px);
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+        /* 防止flex子项撑大父容器 */
+        overflow: hidden;
+        /* 确保内容不会溢出 */
+      }
+
+      .header {
+        position: relative;
+        padding: 18px 32px 18px 18px;
+        border-bottom: 1px solid #e1e5e9;
+        display: flex;
+        justify-content: between;
+        align-items: center;
+        gap: 15px;
+        flex-wrap: wrap;
+      }
+
+      .header h2 {
+        display: flex;
+        align-items: center;
+        margin: 0;
+        color: #495057;
+        user-select: none;
+        -webkit-tap-highlight-color: transparent;
+        -webkit-touch-callout: none;
+      }
+
+      .header h2 .brand {
+        display: flex;
+        align-items: center;
+        margin: 0;
+        color: #495057;
+        gap: 6px;
+        user-select: none;
+      }
+
+      .header .tool-btns {
+        position: absolute;
+        display: flex;
+        top: 0;
+        bottom: 0;
+        right: 14px;
+        width: 10em;
+        height: 32px;
+        margin: auto 0;
+        justify-content: flex-end;
+        align-items: center;
+        gap: 10px;
+      }
+
+      .header .tool-btn {
+        height: 32px;
+        background: rgba(255, 255, 255, 0.3);
+        backdrop-filter: saturate(180%) blur(16px);
+        border: 1px solid #e1e5e9;
+        color: #666;
+        cursor: pointer;
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-size: 12px;
+      }
+
+      .header .tool-btn:hover {
+        background: rgba(255, 255, 255, 0.7);
+        border-color: #a8edea;
+        color: #2d3748;
+        transform: translateY(-1px);
+        box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15);
+      }
+
+      .header .wide-btn {
+        opacity: 0.3;
+      }
+
+      .header .wide-btn:hover {
+        opacity: 1;
+      }
+
+      .api-key-section {
+        margin-bottom: 15px;
+      }
+
+      .api-key-input {
+        width: 100%;
+        padding: 12px;
+        border: 2px solid #e1e5e9;
+        border-radius: 8px;
+        font-size: 14px;
+        transition: border-color 0.3s;
+      }
+
+      .api-key-input:focus {
+        outline: none;
+        border-color: #a8edea;
+      }
+
+      .model-select {
+        border-radius: 6px;
+        background: white;
+        font-size: 14px;
+        cursor: pointer;
+        user-select: none;
+      }
+      .model-select.simple {
+        padding: 8px 12px;
+        border: 2px solid #e1e5e9;
+      }
+
+      /* Tom Select Customization */
+      .ts-wrapper {
+        min-width: 200px;
+        max-width: 400px;
+        display: inline-block;
+      }
+      .ts-wrapper .ts-control {
+        border: 2px solid #e1e5e9 !important;
+        border-radius: 6px !important;
+        padding: 8px 24px 8px 12px !important;
+        box-shadow: none !important;
+        background-image: none !important;
+      }
+      .ts-wrapper .ts-control:after {
+        right: 8px !important;
+      }
+      .ts-control.focus {
+        border-color: #a8edea !important;
+      }
+      .ts-dropdown {
+        border: 2px solid #e1e5e9 !important;
+        border-radius: 6px !important;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1) !important;
+        z-index: 1000 !important;
+      }
+      .ts-dropdown .option {
+        padding: 8px 12px !important;
+      }
+      .ts-dropdown .active {
+        background-color: #f8f9fa !important;
+        color: inherit !important;
+      }
+      .ts-dropdown .ts-dropdown-content {
+        max-height: 21em;
+      }
+
+      .model-wrap {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: nowrap;
+      }
+
+      .model-search-label {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        white-space: nowrap;
+        cursor: pointer;
+        font-size: 14px;
+        color: #4a5568;
+      }
+
+      .model-search-label:hover {
+        color: #2d3748;
+      }
+
+      .model-search {
+        cursor: pointer;
+        width: 16px;
+        height: 16px;
+        margin: 0;
+      }
+
+      .sessions {
+        flex: 1;
+        overflow-x: hidden;
+        overflow-y: auto;
+      }
+
+      .session-item {
+        padding: 8px 12px;
+        margin-bottom: 8px;
+        background: #f8f9fa;
+        border: 1px solid transparent;
+        border-radius: 8px;
+        cursor: pointer;
+        transition: all 0.3s;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+
+      .session-item:hover {
+        background: #e9ecef;
+        /* transform: translateX(3px); */
+      }
+
+      .session-item.active {
+        background: #ffffff;
+        color: #2d3748;
+        border: 1px solid #a8edea;
+        box-shadow: 2px 2px 10px rgba(168, 237, 234, 0.35);
+      }
+
+      .session-title {
+        font-size: 14px;
+        font-weight: 500;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        flex: 1;
+        margin-right: 8px;
+      }
+
+      .delete-btn {
+        background: none;
+        border: none;
+        color: #999;
+        cursor: pointer;
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-size: 16px;
+        opacity: 0.7;
+      }
+
+      .delete-btn:hover {
+        opacity: 1;
+        color: #dc3545;
+        background: rgba(220, 53, 69, 0.1);
+      }
+
+      .new-session-btn {
+        width: 100%;
+        padding: 12px;
+        border: none;
+        border-radius: 8px;
+        background: linear-gradient(135deg, #a8edea 0%, #fed6e3 100%);
+        color: #444;
+        font-size: 14px;
+        font-weight: 500;
+        /* 白色外发光字 */
+        text-shadow: 0 0 5px rgba(255, 255, 255, 0.8);
+        cursor: pointer;
+        margin-bottom: 15px;
+        transition: all 0.2s ease;
+      }
+
+      .new-session-btn:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 4px 12px rgba(76, 175, 80, 0.12);
+        color: #2d3748;
+      }
+
+      .messages-container {
+        flex: 1;
+        overflow-y: auto;
+        overflow-x: hidden;
+        padding: 8px;
+        display: flex;
+        flex-direction: column;
+        gap: 15px;
+        min-width: 0;
+        /* 防止内容撑大容器 */
+      }
+
+      .message-content {
+        flex: 1;
+        line-height: 1.5;
+        white-space: pre-wrap;
+      }
+
+      .input-area {
+        padding: 20px;
+        border-top: 1px solid #e1e5e9;
+        display: flex;
+        gap: 10px;
+        align-items: flex-end;
+        position: relative;
+      }
+
+      .input-wrapper {
+        flex: 1;
+        position: relative;
+      }
+
+      .message-input {
+        display: block;
+        width: 100%;
+        min-height: 44px;
+        max-height: 144px;
+        padding: 9px 16px;
+        padding-right: 34px;
+        border: 2px solid #e1e5e9;
+        border-radius: 22px;
+        resize: none;
+        font-family: inherit;
+        font-size: 14px;
+        line-height: 1.4;
+        transition: border-color 0.3s;
+      }
+
+      .message-input.can-upload {
+        padding-left: 44px;
+      }
+
+      .message-input:focus {
+        outline: none;
+        border-color: #a8edea;
+      }
+
+      .clear-btn {
+        position: absolute;
+        right: 12px;
+        top: 50%;
+        transform: translateY(-50%);
+        width: 20px;
+        height: 20px;
+        background: #cbd5e0;
+        border: none;
+        border-radius: 50%;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 15px;
+        color: #fff;
+        transition: all 0.2s ease;
+        opacity: 0.7;
+      }
+
+      .clear-btn:hover {
+        background: #a0aec0;
+        opacity: 1;
+        transform: translateY(-50%) scale(1.1);
+      }
+
+      .send-btn {
+        padding: 12px 18px;
+        background: #4299e1;
+        color: white;
+        border: none;
+        border-radius: 22px;
+        cursor: pointer;
+        font-size: 14px;
+        font-weight: 500;
+        transition: all 0.2s ease;
+        min-width: 60px;
+        height: 44px;
+        box-shadow: 0 2px 4px rgba(66, 153, 225, 0.3);
+      }
+
+      .send-btn.danger {
+        background: #dc3545;
+        color: white;
+      }
+
+      .send-btn.danger:hover {
+        background: #c82333;
+        transform: translateY(-1px);
+        box-shadow: 0 4px 8px rgba(220, 53, 69, 0.4);
+      }
+
+      .send-btn:hover:not(:disabled):not(.danger) {
+        background: #3182ce;
+        transform: translateY(-1px);
+        box-shadow: 0 4px 8px rgba(66, 153, 225, 0.4);
+      }
+
+      .send-btn:disabled {
+        background: #cbd5e0;
+        color: #a0aec0;
+        cursor: not-allowed;
+        transform: none;
+        box-shadow: none;
+      }
+
+      /* 上传图片按钮 */
+      .upload-image-btn {
+        position: absolute;
+        left: 12px;
+        top: 50%;
+        transform: translateY(-50%);
+        width: 28px;
+        height: 28px;
+        background: none;
+        border: none;
+        cursor: pointer;
+        font-size: 18px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        opacity: 0.6;
+        transition: all 0.2s ease;
+        padding: 0;
+      }
+
+      .upload-image-btn:hover:not(:disabled) {
+        opacity: 1;
+        transform: translateY(-50%) scale(1.1);
+      }
+
+      .upload-image-btn:disabled {
+        opacity: 0.3;
+        cursor: not-allowed;
+      }
+
+      /* 上传的图片标签容器 */
+      .uploaded-images-tags {
+        position: absolute;
+        top: -44px;
+        left: 0;
+        display: flex;
+        gap: 8px;
+        padding-left: 20px;
+        z-index: 10;
+      }
+
+      /* 单个图片标签 */
+      .image-tag {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 8px 4px 4px;
+        background: linear-gradient(135deg, #a8edea 0%, #fed6e3 100%);
+        border-radius: 20px;
+        font-size: 12px;
+        color: #333;
+        box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
+      }
+
+      .image-tag img {
+        width: 28px;
+        height: 28px;
+        border-radius: 50%;
+        object-fit: cover;
+        border: 2px solid white;
+      }
+
+      .image-tag-text {
+        font-weight: 500;
+        white-space: nowrap;
+      }
+
+      .image-tag-remove {
+        width: 18px;
+        height: 18px;
+        border-radius: 50%;
+        background: rgba(0, 0, 0, 0.15);
+        border: none;
+        color: white;
+        cursor: pointer;
+        font-size: 14px;
+        line-height: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: all 0.2s ease;
+        padding: 0;
+      }
+
+      .image-tag-remove:hover {
+        background: rgba(220, 53, 69, 0.8);
+        transform: scale(1.1);
+      }
+
+      /* 问题区域的图片链接 */
+      .question-images {
+        margin-top: 8px;
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      .question-images a {
+        display: inline-block;
+        padding: 4px 10px;
+        background: rgba(168, 237, 234, 0.3);
+        border: 1px solid rgba(168, 237, 234, 0.5);
+        border-radius: 12px;
+        color: #2d3748;
+        text-decoration: none;
+        font-size: 12px;
+        transition: all 0.2s ease;
+      }
+
+      .question-images a:hover {
+        background: rgba(168, 237, 234, 0.5);
+        border-color: #a8edea;
+        transform: translateY(-1px);
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        cursor: pointer;
+      }
+
+      /* SweetAlert2 图片预览样式 */
+      .swal-image-preview {
+        max-width: 90vw !important;
+        max-height: 90vh !important;
+        object-fit: contain !important;
+        margin-top: 2.5em !important;
+        margin-bottom: 0 !important;
+      }
+
+      .swal2-popup:has(.swal-image-preview) {
+        padding-bottom: 0 !important;
+        overflow: hidden !important;
+      }
+
+      .loading {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        color: #a8edea;
+        padding: 0px 16px 16px;
+      }
+
+      .spinner {
+        width: 20px;
+        height: 20px;
+        border: 2px solid #e1e5e9;
+        border-top: 2px solid #a8edea;
+        border-radius: 50%;
+        animation: spin 1s linear infinite;
+      }
+
+      @keyframes spin {
+        0% {
+          transform: rotate(0deg);
+        }
+
+        100% {
+          transform: rotate(360deg);
+        }
+      }
+
+      /* 移动端适配 */
+      @media (max-width: 768px) {
+        body {
+          overflow: hidden;
+        }
+
+        .container {
+          flex-direction: column;
+          padding: 10px;
+          height: 100vh;
+          height: 100dvh;
+          position: relative;
+        }
+
+        .swal2-container h2 {
+          font-size: 1.5em;
+        }
+
+        div.swal2-html-container {
+          padding-left: 1em;
+          padding-right: 1em;
+        }
+
+        .main-chat {
+          flex: 1;
+          min-height: 0;
+          width: 100%;
+          margin-top: 0;
+        }
+
+        .header {
+          padding: 15px;
+          padding-left: 64px;
+          flex-direction: column;
+          align-items: stretch;
+          gap: 10px;
+        }
+
+        .header .tool-btns {
+          top: 16px;
+          bottom: auto;
+          width: 64px;
+          margin: 0;
+        }
+
+        .model-wrap {
+          width: 100%;
+        }
+
+        .model-select {
+          flex: 1;
+          min-width: 0;
+        }
+
+        .model-search-label {
+          flex-shrink: 0;
+          font-size: 13px;
+        }
+
+        .input-area {
+          padding: 12px;
+          gap: 6px;
+        }
+
+        .input-wrapper {
+          flex: 1;
+        }
+
+        .message-input {
+          font-size: 16px;
+          /* 防止iOS缩放 */
+        }
+
+        .sessions {
+          max-height: none;
+          flex: 1;
+        }
+
+        /* 移动端图片标签样式 */
+        .uploaded-images-tags {
+          top: -36px;
+        }
+
+        .image-tag {
+          padding: 3px 6px 3px 3px;
+          font-size: 11px;
+        }
+
+        .image-tag img {
+          width: 24px;
+          height: 24px;
+        }
+
+        .content-section > h4 small {
+          position: relative;
+          display: inline-block;
+          vertical-align: middle;
+          white-space: nowrap;
+          max-width: 27em;
+          padding-bottom: 1px;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+
+        .content-section:hover > h4 small {
+          max-width: 13em;
+        }
+      }
+
+      .empty-state {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        color: #6c757d;
+        text-align: center;
+        padding: 40px;
+      }
+
+      .empty-state h3 {
+        margin-bottom: 10px;
+        color: #495057;
+      }
+
+      .error-message {
+        background: #f8d7da;
+        color: #721c24;
+        padding: 12px 16px;
+        border-radius: 8px;
+        margin: 0 8px;
+        border: 1px solid #f5c6cb;
+      }
+
+      .role-setting {
+        margin-bottom: 15px;
+      }
+
+      .role-textarea {
+        position: relative;
+        width: 100%;
+        min-height: 90px;
+        max-height: 30vh;
+        padding: 12px;
+        border: 2px solid #e1e5e9;
+        border-radius: 8px;
+        font-size: 14px;
+        font-family: inherit;
+        resize: vertical;
+        transition: border-color 0.3s;
+      }
+
+      .role-textarea:focus {
+        outline: none;
+        border-color: #a8edea;
+      }
+
+      .role-textarea[disabled] {
+        color: rgba(0, 0, 0, 0.3);
+      }
+
+      .copy-btn,
+      .reset-btn {
+        background: none;
+        border: 1px solid #e1e5e9;
+        color: #666;
+        cursor: pointer;
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-size: 12px;
+        margin-left: 8px;
+        opacity: 0;
+        transition: all 0.2s;
+      }
+
+      .reset-btn {
+        padding: 3px 8px;
+        opacity: 1 !important;
+      }
+
+      .copy-btn:hover {
+        background: #f8f9fa;
+        border-color: #a8edea;
+      }
+
+      .content-section:hover .copy-btn {
+        opacity: 1;
+      }
+
+      .session-content {
+        display: flex;
+        flex-direction: column;
+        gap: 15px;
+        padding: 8px;
+      }
+
+      .content-section {
+        flex: 0 0 auto;
+        position: relative;
+        padding: 15px;
+        border-radius: 8px;
+        border: 1px solid #e1e5e9;
+      }
+
+      .content-section > h4 {
+        position: relative;
+        margin: 0 0 10px 0;
+        color: #495057;
+        font-size: 14px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        white-space: nowrap;
+        overflow: hidden;
+      }
+
+      .content-section > h4 small {
+        color: #6c757d;
+        font-size: 12px;
+        font-weight: normal;
+      }
+
+      .content-section > h4:has(input:checked) + .rendered-content {
+        position: relative;
+        max-height: 10em;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .role-section {
+        position: relative;
+        background: #f8f9fa;
+      }
+
+      .role-section:has(input:checked):after {
+        content: '';
+        display: block;
+        position: absolute;
+        z-index: 1;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        height: 50%;
+        background: linear-gradient(
+          to bottom,
+          rgba(255, 255, 255, 0) 0%,
+          rgba(248, 249, 250, 1) 80%,
+          rgba(248, 249, 250, 1) 100%
+        );
+        pointer-events: none;
+      }
+
+      .question-section {
+        background: linear-gradient(
+          135deg,
+          rgba(168, 237, 234, 0.18),
+          rgba(254, 214, 227, 0.18)
+        );
+      }
+
+      .answer-section {
+        background: #ffffff;
+      }
+
+      .markdown-body {
+        background: none;
+        white-space-collapse: collapse;
+        overflow-x: auto;
+        max-width: 100%;
+        word-wrap: break-word;
+      }
+
+      /* 表格样式 - 防止溢出 */
+      .markdown-body table {
+        max-width: 100%;
+        width: 100%;
+        table-layout: auto;
+        border-collapse: collapse;
+        margin: 1em 0;
+        font-size: 0.9em;
+      }
+
+      .markdown-body th,
+      .markdown-body td {
+        padding: 8px 12px;
+        border: 1px solid #e1e5e9;
+        text-align: left;
+        vertical-align: top;
+        word-break: break-word;
+        min-width: 0;
+      }
+
+      .markdown-body th {
+        background-color: #f8f9fa;
+        font-weight: 600;
+      }
+
+      /* 表格容器 - 提供水平滚动 */
+      .rendered-content {
+        position: relative;
+        line-height: 1.6;
+        overflow-x: auto;
+        overflow-y: visible;
+        max-width: 100%;
+      }
+
+      .rendered-content p {
+        margin: 0.5em 0;
+      }
+
+      .rendered-content code {
+        background: #f1f3f5;
+        padding: 2px 4px;
+        border-radius: 3px;
+        white-space: pre-wrap !important;
+        word-break: break-all !important;
+        font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+        font-size: 0.9em;
+      }
+
+      .rendered-content pre {
+        background: #f8f9fa;
+        border: 1px solid #e1e5e9;
+        padding: 15px;
+        border-radius: 8px;
+        overflow-x: auto;
+        white-space-collapse: collapse;
+        margin: 1em 0;
+      }
+
+      .rendered-content pre code {
+        background: none;
+        padding: 0;
+      }
+
+      .rendered-content blockquote {
+        border-left: 4px solid #a8edea;
+        margin: 1em 0;
+        padding-left: 1em;
+        color: #666;
+      }
+
+      .streaming-answer {
+        min-height: 1.5em;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="app">
+      <!-- 移动端菜单按钮 -->
+      <button
+        v-cloak
+        v-show="isMobile"
+        class="mobile-menu-btn"
+        style="display: none"
+        @click="toggleSidebar"
+      >
+        {{ !showSidebar ? '☰' : '＜' }}
+      </button>
+      <!-- 移动端遮罩层 -->
+      <div
+        class="sidebar-overlay"
+        :class="{ show: showSidebar && isMobile }"
+        v-cloak
+        @click="hideSidebar"
+      ></div>
+      <div class="container" :class="{ wide: isWideMode }">
+        <!-- 侧边栏 -->
+        <div
+          v-show="true"
+          class="sidebar"
+          :class="{ show: showSidebar || !isMobile, mobile: isMobile }"
+          v-cloak
+          style="display: none"
+        >
+          <!-- API Key 设置 -->
+          <div class="api-key-section">
+            <label
+              for="apiKey"
+              style="display: block; margin-bottom: 8px; font-weight: 500"
+              @dblclick="reloadPage()"
+              >API Key:</label
+            >
+            <input
+              type="password"
+              id="apiKey"
+              v-model="apiKey"
+              @input="saveApiKey"
+              class="api-key-input"
+              placeholder="请输入您的 OpenAI API Key"
+              autocomplete="new-password"
+            />
+          </div>
+          <!-- 角色设定 -->
+          <div class="role-setting">
+            <label
+              for="rolePrompt"
+              style="
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 8px;
+                font-weight: 500;
+              "
+            >
+              <span>
+                <span>角色设定&nbsp;</span>
+                <span v-if="!globalRolePromptEnabled">(已禁用):</span>
+                <span v-else-if="!globalRolePrompt">(可选):</span>
+                <span v-else="">(已启用):</span>
+              </span>
+              <span>
+                <button
+                  class="reset-btn"
+                  style="
+                    width: 0;
+                    padding-left: 0;
+                    padding-right: 0;
+                    margin-left: 0;
+                    visibility: hidden;
+                    pointer-events: none;
+                  "
+                >
+                  　
+                </button>
+                <button
+                  v-if="globalRolePrompt && globalRolePromptEnabled"
+                  class="reset-btn"
+                  @click="clearRolePrompt"
+                  title="清空角色设定"
+                >
+                  清空
+                </button>
+                <button
+                  v-if="globalRolePrompt"
+                  class="reset-btn"
+                  :title="globalRolePromptEnabled ? '禁用角色设定' : '启用角色设定'"
+                  @click="toggleRolePrompt()"
+                >
+                  {{ globalRolePromptEnabled ? '禁用' : '启用' }}
+                </button>
+              </span>
+            </label>
+            <textarea
+              id="rolePrompt"
+              v-model="globalRolePrompt"
+              class="role-textarea"
+              :disabled="!globalRolePromptEnabled && globalRolePrompt.length > 0"
+              placeholder="输入系统提示词或角色设定..."
+              @input="updateGlobalRolePrompt"
+            >
+            </textarea>
+          </div>
+          <!-- 新建会话按钮 -->
+          <button @click="createNewSession" class="new-session-btn">
+            + 新建会话
+          </button>
+          <!-- 会话列表 -->
+          <div class="sessions">
+            <div
+              v-for="session in sessions"
+              :key="session.id"
+              @click="switchSession(session.id)"
+              :class="['session-item', { active: currentSessionId === session.id }]"
+              :title="session.summary || session.title || '新会话'"
+            >
+              <div class="session-title">
+                <span>{{ session.summary || session.title || '新会话' }}</span>
+                <span v-if="session.role">&nbsp;💭</span>
+              </div>
+              <button
+                @click.stop="deleteSession(session.id)"
+                class="delete-btn"
+                title="删除会话"
+              >
+                ×
+              </button>
+            </div>
+          </div>
+        </div>
+        <!-- 主聊天区域 -->
+        <div class="main-chat">
+          <!-- 头部 -->
+          <div class="header">
+            <h2 style="cursor: pointer">
+              <div class="brand" @click="showAbout">
+                <img
+                  src="./favicon.svg"
+                  alt=""
+                  width="24"
+                  height="24"
+                  style="flex: 0 0 auto; line-height: 1"
+                />
+                <span>OpenAI Chat</span>
+              </div>
+            </h2>
+            <div class="model-wrap">
+              <select
+                v-model="selectedModel"
+                class="model-select"
+                :class="{simple: availableModels.length <= 10}"
+                id="selectedModel"
+                :disabled="isLoading || isStreaming"
+                @change="saveData()"
+              >
+                <option v-if="false">　</option>
+                <option
+                  v-for="i in availableModels"
+                  :key="i.value"
+                  :value="i.value"
+                >
+                  {{ i.label }}
+                </option>
+              </select>
+              <label for="needSearch" class="model-search-label">
+                <input
+                  type="checkbox"
+                  v-model="needSearch"
+                  class="model-search"
+                  id="needSearch"
+                  @change="saveData()"
+                />
+                <span>联网搜索</span>
+              </label>
+            </div>
+            <div class="tool-btns">
+              <button
+                v-if="isPC"
+                class="tool-btn wide-btn"
+                @click="toggleWideMode"
+              >
+                {{ isWideMode ? '&nbsp;› 收窄 ‹&nbsp;' : '&nbsp;‹ 加宽 ›&nbsp;'
+                }}
+              </button>
+              <button
+                v-if="currentSession && currentSession.answer && !isLoading && !isStreaming"
+                class="tool-btn share-btn"
+                @click="shareSession"
+              >
+                📸 分享
+              </button>
+            </div>
+          </div>
+          <!-- 消息区域 -->
+          <div class="messages-container" ref="messagesContainer">
+            <div
+              v-if="!currentSession || (!currentSession.question && !currentSession.answer)"
+              class="empty-state"
+            >
+              <h3>开始与 AI 对话</h3>
+              <p>选择一个模型并输入您的问题</p>
+            </div>
+            <div
+              v-if="currentSession && (currentSession.question || currentSession.answer)"
+              class="session-content"
+            >
+              <!-- 角色设定显示 -->
+              <div
+                v-if="currentSession.role.trim()"
+                class="content-section role-section"
+              >
+                <h4>
+                  <span>
+                    <label for="fold">
+                      <span>角色设定　</span>
+                      <input
+                        v-show="!isCapturing"
+                        v-model="isFoldRole"
+                        type="checkbox"
+                        id="fold"
+                      />
+                      <small v-show="!isCapturing">&nbsp;折叠</small>
+                    </label>
+                  </span>
+                  <button
+                    @click="copyToClipboard(currentSession.role)"
+                    class="copy-btn"
+                    title="复制角色设定"
+                  >
+                    复制
+                  </button>
+                </h4>
+                <div
+                  class="rendered-content markdown-body"
+                  v-html="renderMarkdown(currentSession.role)"
+                ></div>
+              </div>
+              <!-- 问题1 -->
+              <div
+                v-if="currentSession.question"
+                class="content-section question-section"
+              >
+                <h4>
+                  <span>
+                    <span>问题</span>
+                    <small v-if="currentSession.createdAt"
+                      >&emsp;{{ formatTimeStr(currentSession.createdAt)
+                      }}</small
+                    >
+                  </span>
+                  <div>
+                    <button
+                      v-if="!isLoading && !isStreaming && !currentSession.question2"
+                      class="copy-btn"
+                      title="编辑问题"
+                      @click="editQuestion()"
+                    >
+                      编辑
+                    </button>
+                    <button
+                      @click="copyToClipboard(currentSession.question)"
+                      class="copy-btn"
+                      title="复制问题"
+                    >
+                      复制
+                    </button>
+                  </div>
+                </h4>
+                <div
+                  class="rendered-content markdown-body"
+                  v-html="renderMarkdown(currentSession.question)"
+                ></div>
+                <!-- 图片链接 -->
+                <div
+                  v-if="currentSession.images && currentSession.images.length > 0"
+                  class="question-images"
+                >
+                  <a
+                    v-for="(img, index) in currentSession.images"
+                    :key="index"
+                    href="javascript:void(0)"
+                    :title="img === 'INVALID' ? '图片未上传,无法预览' : '点击预览'"
+                    :style="img === 'INVALID' ? 'cursor: not-allowed; opacity: 0.5;' : ''"
+                    @click="previewImage(img)"
+                  >
+                    📎 {{ img === 'INVALID' ? '本地' : '' }}图片{{ index + 1 }}
+                  </a>
+                </div>
+              </div>
+              <!-- 回答1 -->
+              <div
+                v-if="currentSession.answer || isStreaming || isLoading && streamingContent"
+                class="content-section answer-section"
+              >
+                <h4>
+                  <span>
+                    <span>回答</span>
+                    <small v-if="currentSession.model"
+                      >&emsp;{{ getModelName(currentSession.model) }}</small
+                    >
+                  </span>
+                  <div v-if="!isStreaming">
+                    <button
+                      v-if="!currentSession.question2"
+                      class="copy-btn"
+                      title="删除并重新回答"
+                      @click="regenerateAnswer()"
+                    >
+                      重新回答
+                    </button>
+                    <button
+                      class="copy-btn"
+                      title="复制回答"
+                      @click="copyToClipboard(currentSession.answer)"
+                    >
+                      复制
+                    </button>
+                  </div>
+                </h4>
+                <div
+                  class="rendered-content markdown-body streaming-answer"
+                  v-html="renderMarkdown((isLoading || isStreaming) && !currentSession.question2 ? streamingContent : currentSession.answer)"
+                  @click="answerClickHandler"
+                ></div>
+              </div>
+              <!-- 问题2 -->
+              <div
+                v-if="currentSession.question2"
+                class="content-section question-section"
+              >
+                <h4>
+                  <span>
+                    <span>追问</span>
+                    <small v-if="currentSession.createdAt2"
+                      >&emsp;{{ formatTimeStr(currentSession.createdAt2)
+                      }}</small
+                    >
+                  </span>
+                  <div>
+                    <button
+                      v-if="!isLoading && !isStreaming"
+                      class="copy-btn"
+                      title="编辑追问"
+                      @click="editQuestion()"
+                    >
+                      编辑
+                    </button>
+                    <button
+                      @click="copyToClipboard(currentSession.question2)"
+                      class="copy-btn"
+                      title="复制问题"
+                    >
+                      复制
+                    </button>
+                  </div>
+                </h4>
+                <div
+                  class="rendered-content markdown-body"
+                  v-html="renderMarkdown(currentSession.question2)"
+                ></div>
+                <!-- 图片链接 -->
+                <div
+                  v-if="currentSession.images2 && currentSession.images2.length > 0"
+                  class="question-images"
+                >
+                  <a
+                    v-for="(img, index) in currentSession.images2"
+                    :key="index"
+                    href="javascript:void(0)"
+                    :title="img === 'INVALID' ? '图片未上传,无法预览' : '点击预览'"
+                    :style="img === 'INVALID' ? 'cursor: not-allowed; opacity: 0.5;' : ''"
+                    @click="previewImage(img)"
+                  >
+                    📎 {{ img === 'INVALID' ? '本地' : '' }}图片{{ index + 1 }}
+                  </a>
+                </div>
+              </div>
+              <!-- 回答2 -->
+              <div
+                v-if="currentSession.question2 && (currentSession.answer2 || isStreaming || isLoading && streamingContent)"
+                class="content-section answer-section"
+              >
+                <h4>
+                  <span>
+                    <span>回答</span>
+                    <small v-if="currentSession.model2"
+                      >&emsp;{{ getModelName(currentSession.model2) }}</small
+                    >
+                  </span>
+                  <div v-if="!isStreaming">
+                    <button
+                      class="copy-btn"
+                      title="删除并重新回答"
+                      @click="regenerateAnswer()"
+                    >
+                      重新回答
+                    </button>
+                    <button
+                      class="copy-btn"
+                      title="复制回答"
+                      @click="copyToClipboard(currentSession.answer2)"
+                    >
+                      复制
+                    </button>
+                  </div>
+                </h4>
+                <div
+                  class="rendered-content markdown-body streaming-answer"
+                  v-html="renderMarkdown((isLoading || isStreaming) ? streamingContent : currentSession.answer2)"
+                  @click="answerClickHandler"
+                ></div>
+              </div>
+            </div>
+            <div v-if="shouldShowLoading" class="loading">
+              <div class="spinner"></div>
+              <span>AI 正在思考中...</span>
+            </div>
+
+            <div v-if="errorMessage" class="error-message">
+              {{ errorMessage }}
+            </div>
+
+            <!-- 重新回答按钮 -->
+            <div
+              v-if="shouldShowRetryButton"
+              style="text-align: center; margin: 0 0 20px"
+            >
+              <button
+                @click="retryCurrentQuestion"
+                class="send-btn"
+                style="margin: 0 auto"
+              >
+                ↺ 重新回答
+              </button>
+            </div>
+          </div>
+          <!-- 输入区域 -->
+          <div class="input-area">
+            <!-- 上传的图片标签 -->
+            <div v-if="uploadedImages.length > 0" class="uploaded-images-tags">
+              <div
+                v-for="(img, index) in uploadedImages"
+                :key="index"
+                class="image-tag"
+              >
+                <img
+                  :src="getImageDisplayUrl(img)"
+                  :alt="'图片' + (index + 1)"
+                />
+                <span class="image-tag-text">图片{{ index + 1 }}</span>
+                <button
+                  class="image-tag-remove"
+                  @click="removeImage(index)"
+                  title="移除图片"
+                >
+                  ×
+                </button>
+              </div>
+            </div>
+
+            <div class="input-wrapper">
+              <!-- 上传图片按钮 -->
+              <button
+                class="upload-image-btn"
+                @click="triggerImageUpload"
+                :disabled="!canInput || uploadedImages.length >= 3 || isUploadingImage"
+                :title="uploadedImages.length >= 3 ? '最多上传3张图片' : '上传图片'"
+              >
+                📎
+              </button>
+              <input
+                type="file"
+                ref="imageInput"
+                accept="image/*"
+                style="display: none"
+                @change="handleImageSelect"
+              />
+
+              <textarea
+                v-model="messageInput"
+                @input="onInputChange"
+                @keydown="handleKeyDown"
+                @paste="handlePaste"
+                class="message-input can-upload"
+                :placeholder="inputPlaceholder"
+                :disabled="!canInput"
+                rows="1"
+                ref="messageInputRef"
+              ></textarea>
+              <button
+                v-show="messageInput.trim()"
+                @click="clearInput"
+                class="clear-btn"
+                title="清空输入"
+              >
+                ×
+              </button>
+            </div>
+            <button
+              v-if="isCurrentEnd"
+              class="send-btn"
+              @click="createNewSession"
+            >
+              新会话
+            </button>
+            <button
+              v-else-if="(isLoading || isStreaming) && isSentForAWhile"
+              class="send-btn danger"
+              @click="cancelStreaming"
+            >
+              中止
+            </button>
+            <button
+              v-else
+              @click="sendMessage"
+              :disabled="!canSend"
+              class="send-btn"
+            >
+              发送
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 隐藏的搜索结果模板 -->
+      <div v-if="searchRes" ref="searchResTemplate" style="display: none">
+        <div
+          style="
+            text-align: left;
+            max-height: 70vh;
+            overflow-y: auto;
+            padding: 10px;
+          "
+        >
+          <!-- 搜索查询 -->
+          <div style="margin-bottom: 20px">
+            <h3 style="margin: 0 0 10px; color: #333; font-size: 16px">
+              🔍 搜索查询
+            </h3>
+            <div
+              style="
+                padding: 12px;
+                background: #f8f9fa;
+                border-radius: 8px;
+                border-left: 4px solid #a8edea;
+              "
+            >
+              <strong style="color: #2d3748; font-size: 15px"
+                >{{ searchRes.query }}</strong
+              >
+            </div>
+          </div>
+
+          <!-- AI 总结答案 -->
+          <div v-if="searchRes.answer" style="margin-bottom: 20px">
+            <h3 style="margin: 0 0 10px; color: #333; font-size: 16px">
+              💡 AI 总结
+            </h3>
+            <div
+              style="
+                padding: 12px;
+                background: #fff3cd;
+                border-radius: 8px;
+                border-left: 4px solid #ffc107;
+                line-height: 1.6;
+                color: #666;
+                font-size: 14px;
+              "
+            >
+              {{ searchRes.answer }}
+            </div>
+          </div>
+
+          <!-- 搜索结果列表 -->
+          <div v-if="searchRes.results && searchRes.results.length > 0">
+            <div style="margin-bottom: 10px">
+              <h3 style="margin: 0 0 10px; color: #333; font-size: 16px">
+                📚 搜索结果 ({{ searchRes.results.length }} 条)
+              </h3>
+            </div>
+
+            <div
+              v-for="(result, index) in searchRes.results"
+              :key="index"
+              style="
+                margin-bottom: 15px;
+                padding: 15px;
+                background: #ffffff;
+                border: 1px solid #e1e5e9;
+                border-radius: 8px;
+                box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+              "
+            >
+              <div style="margin-bottom: 8px">
+                <span
+                  style="
+                    display: inline-block;
+                    padding: 2px 8px;
+                    background: #a8edea;
+                    color: #2d3748;
+                    border-radius: 4px;
+                    font-size: 12px;
+                    font-weight: 500;
+                    margin-right: 8px;
+                  "
+                >
+                  {{ index + 1 }}
+                </span>
+                <strong style="color: #2d3748; font-size: 14px">
+                  {{ result.title || '无标题' }}
+                </strong>
+              </div>
+
+              <div
+                v-if="result.content"
+                style="
+                  margin: 8px 0;
+                  color: #666;
+                  font-size: 13px;
+                  line-height: 1.5;
+                  overflow: hidden;
+                  text-overflow: ellipsis;
+                  display: -webkit-box;
+                  line-clamp: 5;
+                  -webkit-line-clamp: 5;
+                  -webkit-box-orient: vertical;
+                "
+              >
+                {{ result.content.length > 300 ? result.content.slice(0, 300) +
+                '...' : result.content }}
+              </div>
+
+              <div v-if="result.url" style="margin-top: 8px; line-height: 1.5">
+                <a
+                  :href="result.url"
+                  target="_blank"
+                  style="
+                    color: #0066cc;
+                    text-decoration: none;
+                    font-size: 12px;
+                    word-break: break-all;
+                    display: -webkit-box;
+                    line-clamp: 2;
+                    -webkit-line-clamp: 2;
+                    -webkit-box-orient: vertical;
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                  "
+                >
+                  🔗 {{ result.url }}
+                </a>
+              </div>
+            </div>
+          </div>
+
+          <!-- 无结果提示 -->
+          <div
+            v-else
+            style="
+              padding: 20px;
+              text-align: center;
+              color: #999;
+              font-size: 14px;
+            "
+          >
+            暂无搜索结果
+          </div>
+        </div>
+      </div>
+
+      <!-- 隐藏的关于页面模板 -->
+      <div ref="aboutTemplate" style="display: none">
+        <div style="max-height: 70vh; overflow-y: auto; text-align: left">
+          <div style="text-align: left; padding: 10px">
+            <h3 style="margin: 0 0 10px; color: #333">✨ 应用简介</h3>
+            <p style="line-height: 1.6; color: #666">
+              这是一个简单易用的 OpenAI API 代理服务，基于 Deno Deploy /
+              Cloudflare Workers 部署。 只需要一个域名和 OpenAI API
+              Key，即可免费为家人朋友提供 AI 问答服务。
+            </p>
+
+            <h3 style="margin: 20px 0 10px; color: #333">🎯 核心功能</h3>
+            <ul style="line-height: 1.8; color: #666; padding-left: 20px">
+              <li>提供标准的 OpenAI API 代理端点</li>
+              <li>支持密码保护，避免暴露 API Key</li>
+              <li>内置精美的 Web 聊天界面</li>
+              <li>PWA 适配，支持移动设备添加到桌面</li>
+              <li>流式响应，实时显示 AI 回答</li>
+              <li>基于 IndexedDB 本地历史记录存储</li>
+              <li>支持模型切换和自定义系统提示词</li>
+              <li>集成 Tavily 搜索，为 AI 提供实时网络信息</li>
+              <li>一键生成问答截图，方便分享</li>
+              <li>智能会话命名，便于查找管理</li>
+            </ul>
+
+            <h3 style="margin: 20px 0 10px; color: #333">🔗 GitHub 仓库</h3>
+            <p style="line-height: 1.6; color: #666">
+              <a
+                href="https://github.com/icheer/openai-webui-lite"
+                target="_blank"
+                style="color: #0066cc; text-decoration: none"
+              >
+                https://github.com/icheer/openai-webui-lite
+              </a>
+            </p>
+
+            <p style="margin: 20px 0 10px; color: #999; font-size: 0.9em">
+              请合理使用 AI 资源，避免滥用！
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const { createApp } = Vue;
+
+      window.app = createApp({
+        data() {
+          return {
+            apiKey: '',
+            messageInput: '',
+            isLoading: false,
+            isSentForAWhile: false,
+            errorMessage: '',
+            selectedModel: 'gpt-5-mini',
+            availableModels: ['$MODELS_PLACEHOLDER$'],
+            sessions: [],
+            currentSessionId: null,
+            isFoldRole: false,
+            isCapturing: false,
+            globalRolePrompt: '',
+            globalRolePromptEnabled: true,
+            isMobile: window.innerWidth <= 768, // 是否移动设备
+            isWideMode: !!localStorage.getItem('wideMode'),
+            showSidebar: false,
+            isStreaming: false,
+            streamingContent: '',
+            abortController: null,
+            uploadedImages: [], // 待发送的图片列表 [{ url: string, file: File }]
+            isUploadingImage: false,
+            needSearch: false,
+            searchRes: null,
+            tomSelect: null,
+            sidebarHashAdded: false, // 标记是否为侧边栏添加了hash
+            swalHashAdded: false // 标记是否为弹窗添加了hash
+          };
+        },
+        computed: {
+          isPC() {
+            return !this.isMobile;
+          },
+          hostname() {
+            return window.location.hostname;
+          },
+          isMySite() {
+            return this.hostname.endsWith('.keyi.ma');
+          },
+          currentSession() {
+            return this.sessions.find(s => s.id === this.currentSessionId);
+          },
+          isCurrentEnd() {
+            const session = this.currentSession;
+            if (!session) return false;
+            return (
+              !this.isLoading &&
+              !this.isStreaming &&
+              session.answer &&
+              session.answer2
+            );
+          },
+          isTotallyBlank() {
+            const list = this.sessions || [];
+            return !list.some(s => s.answer);
+          },
+          inputPlaceholder() {
+            const session = this.currentSession || {};
+            const suffix = this.getRolePrompt() ? ' (role ✓)' : '';
+            if (!this.apiKey) {
+              return '请先在左上角设置 API Key';
+            } else if (this.isLoading) {
+              return 'AI 正在思考中...';
+            } else if (this.isStreaming) {
+              return 'AI 正在生成回答...';
+            } else if (this.isUploadingImage) {
+              return '图片上传中...';
+            } else if (session.answer2) {
+              return '当前会话已结束';
+            } else if (!this.selectedModel) {
+              return '请选择一个模型';
+            } else if (session.answer) {
+              return '输入您的追问...' + suffix;
+            } else {
+              return '输入您的问题...' + suffix;
+            }
+          },
+          canInput() {
+            const session = this.currentSession;
+            return (
+              this.apiKey &&
+              !this.isLoading &&
+              !this.isStreaming &&
+              (!session || !session.answer2)
+            );
+          },
+          canSend() {
+            return (
+              (this.messageInput.trim() || this.uploadedImages.length > 0) &&
+              this.selectedModel &&
+              !this.isUploadingImage &&
+              this.canInput
+            );
+          },
+          canUploadImage() {
+            const isModelSupport = /(gpt|qwen|kimi)/.test(this.selectedModel);
+            return isModelSupport && this.isMySite;
+          },
+          // 判断是否需要显示loading
+          shouldShowLoading() {
+            if (this.isLoading) return true;
+            if (this.isStreaming) {
+              if (!this.streamingContent) return true;
+              if (this.streamingContent.endsWith(' 条相关信息。\\n\\n'))
+                return true;
+            }
+            return false;
+          },
+          // 判断是否需要显示"重新回答"按钮（有问题但没有回答，且没有正在加载）
+          shouldShowRetryButton() {
+            const session = this.currentSession;
+            if (!session) return false;
+            if (this.isLoading || this.isStreaming) return false;
+
+            // 情况1: 有question但没有answer
+            if (session.question && !session.answer) {
+              return true;
+            }
+
+            // 情况2: 有question2但没有answer2
+            if (session.question2 && !session.answer2) {
+              return true;
+            }
+
+            return false;
+          }
+        },
+        async mounted() {
+          this.initModels();
+
+          // 初始化 IndexedDB
+          await window.openaiDB.init();
+
+          // 配置 marked
+          marked.setOptions({
+            breaks: true, // 支持 GFM 换行
+            gfm: true, // 启用 GitHub Flavored Markdown
+            tables: true, // 支持表格
+            pedantic: false, // 不使用原始的 markdown.pl 规则
+            sanitize: false, // 不清理 HTML（因为我们信任内容）
+            smartLists: true, // 使用更智能的列表行为
+            smartypants: false // 不使用智能标点符号
+          });
+          marked.use({
+            extensions: [
+              {
+                name: 'strongWithCJK',
+                level: 'inline',
+                start(src) {
+                  return src.match(/\\*\\*/)?.index;
+                },
+                tokenizer(src) {
+                  const rule = /^\\*\\*([^\\*]+?)\\*\\*/;
+                  const match = rule.exec(src);
+                  if (match) {
+                    return {
+                      type: 'strongWithCJK',
+                      raw: match[0],
+                      text: match[1]
+                    };
+                  }
+                },
+                renderer(token) {
+                  return '<strong>' + token.text + '</strong>';
+                }
+              }
+            ]
+          });
+
+          await this.loadData();
+          if (this.sessions.length === 0) {
+            this.createNewSession();
+          }
+          // 检测是否为移动端
+          this.checkMobile();
+          window.addEventListener('resize', this.checkMobile);
+
+          // 监听浏览器后退事件（移动端体验优化）
+          window.addEventListener('popstate', this.handlePopState);
+
+          // 计算OpenAI DB总数据量
+          const totalDataSize = await window.openaiDB.getTotalDataSize();
+          if (totalDataSize > 2) {
+            this.showSwal({
+              title: '数据量过大',
+              text:
+                '当前存储的数据量为' +
+                totalDataSize.toFixed(2) +
+                ' MB，超过了 2MB，可能会影响性能。建议清理一些旧会话。',
+              icon: 'warning',
+              confirmButtonText: '&nbsp;知道了&nbsp;'
+            });
+          }
+
+          this.$nextTick(() => {
+            this.initTomSelect();
+          });
+        },
+
+        beforeUnmount() {
+          window.removeEventListener('resize', this.checkMobile);
+          window.removeEventListener('popstate', this.handlePopState);
+        },
+        watch: {
+          messageInput() {
+            this.autoResizeTextarea();
+          },
+          streamingContent() {
+            this.stickToBottom();
+          },
+          selectedModel(newVal) {
+            if (this.tomSelect && this.tomSelect.getValue() !== newVal) {
+              this.tomSelect.setValue(newVal, true);
+            }
+          }
+        },
+        methods: {
+          // 移动端后退体验优化：添加hash锚点
+          addHash(type) {
+            if (!this.isMobile) return;
+            const hash = '#' + type;
+            if (window.location.hash !== hash) {
+              window.history.pushState(null, '', hash);
+            }
+          },
+
+          // 移动端后退体验优化：移除hash锚点
+          removeHash() {
+            if (!this.isMobile) return;
+            if (window.location.hash) {
+              window.history.back();
+            }
+          },
+
+          // 移动端后退体验优化：处理浏览器后退事件
+          handlePopState(event) {
+            if (!this.isMobile) return;
+
+            // 如果侧边栏是打开的，关闭它
+            if (this.showSidebar && this.sidebarHashAdded) {
+              this.showSidebar = false;
+              this.sidebarHashAdded = false;
+              return;
+            }
+
+            // 如果有Swal弹窗打开，关闭它
+            if (Swal.isVisible() && this.swalHashAdded) {
+              Swal.close();
+              this.swalHashAdded = false;
+              return;
+            }
+          },
+
+          // 包装Swal.fire以支持移动端hash管理
+          showSwal(options, addHash = true) {
+            const isMobile = this.isMobile;
+            const originalDidOpen = options.didOpen;
+            const originalWillClose = options.willClose;
+
+            // 扩展didOpen回调
+            options.didOpen = (...args) => {
+              if (isMobile && addHash) {
+                this.addHash('modal');
+                this.swalHashAdded = true;
+              }
+              if (originalDidOpen) {
+                originalDidOpen.apply(this, args);
+              }
+            };
+
+            // 扩展willClose回调
+            options.willClose = (...args) => {
+              if (isMobile && addHash && this.swalHashAdded) {
+                this.removeHash();
+                this.swalHashAdded = false;
+              }
+              if (originalWillClose) {
+                originalWillClose.apply(this, args);
+              }
+            };
+
+            return Swal.fire(options);
+          },
+
+          // 切换PC宽屏模式
+          toggleWideMode(flag = undefined) {
+            this.isWideMode = !this.isWideMode;
+            if (flag === true) {
+              this.isWideMode = true;
+            } else if (flag === false) {
+              this.isWideMode = false;
+            }
+            if (this.isWideMode) {
+              localStorage.setItem('wideMode', '1');
+            } else {
+              localStorage.removeItem('wideMode');
+            }
+          },
+
+          initTomSelect() {
+            if (this.tomSelect) return;
+            if (this.availableModels.length <= 10) return;
+            const el = document.getElementById('selectedModel');
+            if (!el) return;
+            const config = {
+              plugins: ['dropdown_input'],
+              valueField: 'value',
+              labelField: 'label',
+              searchField: ['label', 'value'],
+              options: this.availableModels,
+              items: [this.selectedModel],
+              create: false,
+              maxOptions: 100,
+              maxItems: 1,
+              render: {
+                option: function (data, escape) {
+                  return (
+                    '<div>' +
+                    '<span class="title">' +
+                    escape(data.label) +
+                    '</span>' +
+                    '</div>'
+                  );
+                },
+                item: function (data, escape) {
+                  return '<div>' + escape(data.label) + '</div>';
+                },
+                no_results: function (data, escape) {
+                  return '<div class="no-results" style="padding: 0.75em; text-align: center; color: #999;">查无此项</div>';
+                }
+              },
+              onChange: value => {
+                this.selectedModel = value;
+                this.saveData();
+              },
+              onDelete: () => false,
+              onInitialize: () => {
+                const input = document.querySelector(
+                  '.dropdown-input-wrap input'
+                );
+                if (!input) return;
+                input.style.paddingLeft = '12px';
+                input.style.paddingRight = '12px';
+                input.setAttribute('placeholder', '模型关键词');
+              }
+            };
+            const tomSelect = new TomSelect(el, config);
+            this.tomSelect = tomSelect;
+            document.body.ontouchmove = e => {
+              const isInDropdown = e.target.closest('.ts-dropdown');
+              const isDropdownOpen = tomSelect.isOpen;
+              if (isDropdownOpen && !isInDropdown) {
+                tomSelect.close();
+              }
+            };
+          },
+          initModels() {
+            const firstItem = this.availableModels[0];
+            if (typeof firstItem === 'string') {
+              this.availableModels = firstItem
+                .trim()
+                .split(',')
+                .map(id => id.trim())
+                .filter(id => id)
+                .map(id => {
+                  if (id.includes('=')) {
+                    const [value, label] = id.split('=').map(s => s.trim());
+                    return { value, label };
+                  }
+                  const parts = id.split('-');
+                  parts.forEach((part, index) => {
+                    if (part.includes('/')) {
+                      const idx = part.indexOf('/');
+                      part =
+                        part.slice(0, idx + 1) +
+                        (part.charAt(idx + 1) || '').toUpperCase() +
+                        part.slice(idx + 2);
+                    }
+                    parts[index] = part.charAt(0).toUpperCase() + part.slice(1);
+                  });
+                  let label = parts.join(' ');
+                  label = label
+                    .replace(' Vl ', ' VL ')
+                    .replace('Deepseek', 'DeepSeek')
+                    .replace('Maxthinking', 'MaxThinking')
+                    .replace('Glm', 'GLM')
+                    .replace('Gpt', 'GPT')
+                    .replace(' Cc', ' CC')
+                    .replace('Or/', 'OR/')
+                    .replace('Cs/', 'CS/')
+                    .replace('Iflow/', 'iFlow/')
+                    .replace('Gcli', 'gCLI')
+                    .replace('B4u/', 'B4U/')
+                    .replace('Kfc/', 'KFC/')
+                    .replace('/', ' / ');
+                  return {
+                    value: id,
+                    label: label
+                  };
+                });
+            }
+          },
+          reloadPage() {
+            location.reload();
+          },
+          // 备用的花括号解析方法，用于处理特殊情况
+          parseWithBraceMethod(inputBuffer) {
+            let buffer = inputBuffer;
+            let braceCount = 0;
+            let startIndex = -1;
+            let processed = false;
+
+            for (let i = 0; i < buffer.length; i++) {
+              if (buffer[i] === '{') {
+                if (braceCount === 0) {
+                  startIndex = i;
+                }
+                braceCount++;
+              } else if (buffer[i] === '}') {
+                braceCount--;
+                if (braceCount === 0 && startIndex !== -1) {
+                  // 找到完整的JSON对象
+                  const jsonStr = buffer.substring(startIndex, i + 1);
+
+                  try {
+                    const data = JSON.parse(jsonStr);
+
+                    if (
+                      data.candidates &&
+                      data.candidates[0] &&
+                      data.candidates[0].content
+                    ) {
+                      const content = data.candidates[0].content;
+                      const delta =
+                        (content &&
+                          content.parts[0] &&
+                          content.parts[0].text) ||
+                        '';
+                      if (delta) {
+                        const shouldScroll = !this.streamingContent;
+                        this.streamingContent += delta;
+                        if (shouldScroll) {
+                          this.scrollToBottom();
+                        }
+                      }
+                      processed = true;
+                    }
+                  } catch (parseError) {
+                    console.warn(
+                      '花括号解析方法也失败:',
+                      parseError,
+                      'JSON:',
+                      jsonStr
+                    );
+                  }
+
+                  // 移除已处理的部分
+                  buffer = buffer.substring(i + 1);
+                  i = -1; // 重置循环
+                  startIndex = -1;
+                  braceCount = 0;
+                }
+              }
+            }
+
+            return { buffer, processed };
+          },
+
+          sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+          },
+          async loadData() {
+            // 加载 API Key
+            this.apiKey =
+              (await window.openaiDB.getItem('openai_api_key')) || '';
+
+            // 加载全局角色设定
+            this.globalRolePrompt =
+              (await window.openaiDB.getItem('openai_global_role_prompt')) ||
+              '';
+            this.globalRolePromptEnabled =
+              (await window.openaiDB.getItem(
+                'openai_global_role_prompt_enabled'
+              )) !== false;
+
+            // 加载会话数据
+            const savedSessions = await window.openaiDB.getItem(
+              'openai_sessions'
+            );
+            if (savedSessions) {
+              this.sessions = JSON.parse(savedSessions);
+            }
+
+            // 加载当前会话ID
+            const savedCurrentId = await window.openaiDB.getItem(
+              'openai_current_session'
+            );
+            if (
+              savedCurrentId &&
+              this.sessions.find(s => s.id === savedCurrentId)
+            ) {
+              this.currentSessionId = savedCurrentId;
+            } else if (this.sessions.length > 0) {
+              this.currentSessionId = this.sessions[0].id;
+            }
+            this.autoFoldRolePrompt();
+
+            // 加载选中的模型
+            this.selectedModel =
+              (await window.openaiDB.getItem('openai_selected_model')) ||
+              this.availableModels[0].value;
+
+            // 加载联网搜索开关状态
+            this.needSearch = !!(await window.openaiDB.getItem(
+              'openai_enable_search'
+            ));
+
+            // 加载当前会话的草稿
+            this.loadDraftFromCurrentSession();
+
+            // 首次向用户询问 API Key
+            if (!this.apiKey && this.isTotallyBlank) {
+              this.askApiKeyIfNeeded();
+            }
+          },
+
+          async saveData() {
+            await window.openaiDB.setItem(
+              'openai_sessions',
+              JSON.stringify(this.sessions)
+            );
+            await window.openaiDB.setItem(
+              'openai_current_session',
+              this.currentSessionId
+            );
+            await window.openaiDB.setItem(
+              'openai_selected_model',
+              this.selectedModel
+            );
+            await window.openaiDB.setItem(
+              'openai_enable_search',
+              this.needSearch
+            );
+          },
+
+          async saveApiKey() {
+            await window.openaiDB.setItem('openai_api_key', this.apiKey);
+          },
+
+          askApiKeyIfNeeded() {
+            if (this.apiKey) return;
+            this.showSwal({
+              title: '请输入 API Key',
+              input: 'password',
+              inputPlaceholder: '请输入您的 OpenAI API Key',
+              showCancelButton: true,
+              confirmButtonText: '保存',
+              cancelButtonText: '取消',
+              reverseButtons: true,
+              preConfirm: value => {
+                if (!value) {
+                  Swal.showValidationMessage('API Key 不能为空');
+                  return false;
+                }
+                this.apiKey = value;
+                this.saveApiKey();
+              }
+            });
+          },
+
+          createNewSession() {
+            if (this.isLoading || this.isStreaming || this.isUploadingImage)
+              return;
+            // 保存当前会话的草稿
+            this.saveDraftToCurrentSession();
+            const firstSession = this.sessions[0];
+            if (firstSession && !firstSession.question) {
+              this.currentSessionId = firstSession.id;
+            } else {
+              const newSession = {
+                id: Date.now().toString(),
+                title: '新会话',
+                summary: '',
+                model: '',
+                model2: '',
+                role: '',
+                question: '',
+                answer: '',
+                question2: '',
+                answer2: '',
+                createdAt: '',
+                createdAt2: '',
+                draft: '',
+                images: [],
+                images2: []
+              };
+              this.sessions.unshift(newSession);
+              this.currentSessionId = newSession.id;
+            }
+            // 加载新会话的草稿
+            this.loadDraftFromCurrentSession();
+            this.saveData();
+            // 移动端创建新会话后隐藏侧边栏
+            if (this.isMobile) {
+              this.hideSidebar();
+            }
+          },
+
+          switchSession(sessionId) {
+            if (this.isLoading || this.isStreaming || this.isUploadingImage)
+              return;
+            // 保存当前会话的草稿
+            this.saveDraftToCurrentSession();
+            this.currentSessionId = sessionId;
+            // 加载新会话的草稿
+            this.loadDraftFromCurrentSession();
+            this.saveData();
+            // 移动端切换会话后隐藏侧边栏
+            if (this.isMobile) {
+              this.hideSidebar();
+            }
+            this.scrollToTop();
+          },
+
+          deleteSession(sessionId) {
+            if (this.isLoading || this.isStreaming || this.isUploadingImage)
+              return;
+            const doDelete = () => {
+              this.sessions = this.sessions.filter(s => s.id !== sessionId);
+              if (this.currentSessionId === sessionId) {
+                this.currentSessionId =
+                  this.sessions.length > 0 ? this.sessions[0].id : null;
+              }
+              if (this.sessions.length === 0) {
+                this.createNewSession();
+              }
+              this.loadDraftFromCurrentSession();
+              this.saveData();
+            };
+            // 如果是空会话, 直接删除
+            const session = this.sessions.find(s => s.id === sessionId);
+            if (!session) return;
+            if (!session.question && !session.answer && !session.draft) {
+              doDelete();
+              return;
+            }
+            this.showSwal(
+              {
+                title: '确认删除',
+                text: '您确定要删除这个会话吗？',
+                icon: 'warning',
+                showCancelButton: true,
+                confirmButtonColor: '#d33',
+                confirmButtonText: '删除',
+                cancelButtonText: '取消',
+                reverseButtons: true
+              },
+              false
+            ).then(result => {
+              if (result.isConfirmed) {
+                doDelete();
+              }
+            });
+          },
+
+          updateRolePrompt() {
+            this.saveData();
+          },
+
+          async updateGlobalRolePrompt() {
+            if (!this.globalRolePrompt && !this.globalRolePromptEnabled) {
+              this.globalRolePromptEnabled = true;
+              return;
+            }
+            await window.openaiDB.setItem(
+              'openai_global_role_prompt',
+              this.globalRolePrompt
+            );
+            await window.openaiDB.setItem(
+              'openai_global_role_prompt_enabled',
+              this.globalRolePromptEnabled
+            );
+          },
+
+          getRolePrompt() {
+            if (this.globalRolePromptEnabled) {
+              return this.globalRolePrompt.trim();
+            }
+            return '';
+          },
+
+          clearRolePrompt() {
+            this.globalRolePrompt = '';
+            this.globalRolePromptEnabled = true;
+            this.updateGlobalRolePrompt();
+          },
+
+          toggleRolePrompt() {
+            this.globalRolePromptEnabled = !this.globalRolePromptEnabled;
+            this.updateGlobalRolePrompt();
+          },
+
+          // 触发图片上传
+          triggerImageUpload() {
+            if (this.uploadedImages.length >= 3) return;
+            this.preheatImageUploadService();
+            this.$refs.imageInput.click();
+          },
+
+          // 预先调用上传图片服务的/health接口,以减少首次上传延迟
+          async preheatImageUploadService() {
+            if (!this.isMySite) return;
+            return fetch('https://pic.keyi.ma/health')
+              .then(() => {})
+              .catch(() => {});
+          },
+
+          // 处理粘贴事件
+          async handlePaste(event) {
+            const clipboardData = event.clipboardData || window.clipboardData;
+            if (!clipboardData) return;
+            const items = clipboardData.items;
+            if (!items || !items.length) return;
+
+            // 遍历剪贴板项目，查找图片
+            for (let i = 0; i < items.length; i++) {
+              const item = items[i];
+
+              // 检查是否为图片类型
+              if (item.type.startsWith('image/')) {
+                event.preventDefault(); // 阻止默认粘贴行为
+
+                // 检查是否已达到上传限制
+                if (this.uploadedImages.length >= 3) {
+                  this.showSwal({
+                    title: '无法上传',
+                    text: '最多只能上传3张图片',
+                    icon: 'warning',
+                    confirmButtonText: '确定'
+                  });
+                  return;
+                }
+
+                // 获取图片文件
+                const file = item.getAsFile();
+                if (!file) continue;
+
+                // 检查文件大小 (限制10MB)
+                if (file.size > 10 * 1024 * 1024) {
+                  this.showSwal({
+                    title: '文件过大',
+                    text: '图片大小不能超过10MB',
+                    icon: 'error',
+                    confirmButtonText: '确定'
+                  });
+                  return;
+                }
+
+                if (i === 0) {
+                  await this.preheatImageUploadService();
+                }
+                // 上传图片
+                await this.uploadImageFile(file);
+                return; // 只处理第一张图片
+              }
+            }
+          },
+
+          // 上传图片文件（提取公共逻辑）
+          async uploadImageFile(file) {
+            this.isUploadingImage = true;
+            try {
+              // 如果当前模型支持图片上传,则上传到图床
+              if (this.canUploadImage) {
+                const formData = new FormData();
+                formData.append('image', file);
+
+                // 创建超时 Promise
+                const timeoutPromise = new Promise((_, reject) => {
+                  setTimeout(
+                    () => reject(new Error('上传超时（15秒）')),
+                    15000
+                  );
+                });
+
+                // 创建上传图床 Promise
+                const uploadPromise = fetch('https://pic.keyi.ma/upload', {
+                  method: 'POST',
+                  body: formData
+                });
+
+                // 使用 Promise.race 实现超时控制
+                const response = await Promise.race([
+                  uploadPromise,
+                  timeoutPromise
+                ]);
+
+                if (!response.ok) {
+                  throw new Error('上传失败: ' + response.statusText);
+                }
+
+                const data = await response.json();
+
+                if (data.success && data.url) {
+                  this.uploadedImages.push({
+                    url: data.url,
+                    file: file
+                  });
+                } else {
+                  throw new Error('上传失败: 返回数据格式错误');
+                }
+              } else {
+                // 不支持图片URL的模型,只保存file对象,发送时再转base64
+                this.uploadedImages.push({
+                  file: file
+                });
+              }
+            } catch (error) {
+              console.error('上传图片失败:', error);
+              this.showSwal({
+                title: '上传失败',
+                text: error.message,
+                icon: 'error',
+                confirmButtonText: '确定'
+              });
+            } finally {
+              this.isUploadingImage = false;
+            }
+          },
+
+          // 处理图片选择
+          async handleImageSelect(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            // 检查文件类型
+            if (!file.type.startsWith('image/')) {
+              this.showSwal({
+                title: '文件类型错误',
+                text: '请选择图片文件',
+                icon: 'error',
+                confirmButtonText: '确定'
+              });
+              event.target.value = '';
+              return;
+            }
+
+            // 检查文件大小 (限制10MB)
+            if (file.size > 10 * 1024 * 1024) {
+              this.showSwal({
+                title: '文件过大',
+                text: '图片大小不能超过10MB',
+                icon: 'error',
+                confirmButtonText: '确定'
+              });
+              event.target.value = '';
+              return;
+            }
+
+            // 上传图片
+            await this.uploadImageFile(file);
+            event.target.value = ''; // 清空input,允许重复选择同一文件
+          },
+
+          // 移除图片
+          removeImage(index) {
+            this.uploadedImages.splice(index, 1);
+          },
+
+          // 清空上传的图片
+          clearUploadedImages() {
+            this.uploadedImages = [];
+          },
+
+          // 预览图片
+          previewImage(imageUrl) {
+            // 如果是INVALID标记,不支持预览
+            if (imageUrl === 'INVALID') return;
+            this.showSwal({
+              imageUrl: imageUrl,
+              imageAlt: '图片预览',
+              showCloseButton: true,
+              showConfirmButton: false,
+              width: 'auto',
+              customClass: {
+                image: 'swal-image-preview'
+              }
+            });
+          },
+
+          // 获取图片的显示URL(用于标签显示)
+          getImageDisplayUrl(img) {
+            if (img.url) {
+              return img.url;
+            } else if (img.file) {
+              return URL.createObjectURL(img.file);
+            }
+            return '';
+          },
+
+          // 将File对象转为base64
+          fileToBase64(file) {
+            return new Promise((resolve, reject) => {
+              const reader = new FileReader();
+              reader.onload = () => resolve(reader.result);
+              reader.onerror = reject;
+              reader.readAsDataURL(file);
+            });
+          },
+
+          formatTimeStr(time) {
+            let str = new Date(time).toLocaleString();
+            const regex = new RegExp(':\\\\d{1,2}$');
+            str = str.replace(regex, '');
+            return str;
+          },
+
+          checkMobile() {
+            const isUaMobile = navigator.userAgent
+              .toLowerCase()
+              .includes('mobile');
+            const isSizeMobile = window.innerWidth <= 768;
+            this.isMobile = isUaMobile || isSizeMobile;
+            if (this.isMobile) {
+              document.body.className = 'mobile';
+              this.toggleWideMode(false);
+              return true;
+            } else {
+              document.body.className = 'pc';
+              return false;
+            }
+          },
+
+          toggleSidebar() {
+            if (this.isLoading || this.isStreaming) return;
+            this.showSidebar = !this.showSidebar;
+
+            // 移动端优化：显示侧边栏时添加hash，隐藏时移除hash
+            if (this.isMobile) {
+              if (this.showSidebar) {
+                this.addHash('sidebar');
+                this.sidebarHashAdded = true;
+              } else {
+                if (this.sidebarHashAdded) {
+                  this.removeHash();
+                  this.sidebarHashAdded = false;
+                }
+              }
+            }
+          },
+
+          hideSidebar() {
+            this.showSidebar = false;
+            // 移动端优化：隐藏侧边栏时移除hash
+            if (this.isMobile && this.sidebarHashAdded) {
+              this.removeHash();
+              this.sidebarHashAdded = false;
+            }
+          },
+
+          cancelStreaming() {
+            if (this.abortController) {
+              this.abortController.abort();
+              this.abortController = undefined;
+            }
+            this.isStreaming = false;
+            this.isLoading = false;
+            const session = this.currentSession;
+            const answerKey = session.question2 ? 'answer2' : 'answer';
+            this.currentSession[answerKey] = this.streamingContent;
+            this.saveData();
+            this.streamingContent = '';
+          },
+
+          renderMarkdown(text) {
+            if (!text) return '';
+
+            // 使用 marked 解析 Markdown
+            let html = marked.parse(text);
+
+            return html;
+          },
+
+          copyToClipboard(text) {
+            navigator.clipboard
+              .writeText(text)
+              .then(() => {
+                this.showSwal({
+                  title: '复制成功',
+                  text: '内容已复制到剪贴板',
+                  icon: 'success',
+                  timer: 1500,
+                  showConfirmButton: false
+                });
+              })
+              .catch(() => {
+                this.showSwal({
+                  title: '复制失败',
+                  text: '请手动复制内容',
+                  icon: 'error',
+                  confirmButtonText: '确定'
+                });
+              });
+          },
+
+          answerClickHandler(e) {
+            const target = e.target;
+            if (target.tagName !== 'A') return;
+            if (target.href === 'javascript:void(0)') {
+              e.preventDefault();
+            }
+            const blockquote = target.closest('blockquote');
+            const isClickingSearchRes =
+              blockquote && blockquote.innerText.startsWith('联网搜索：');
+            if (!isClickingSearchRes) return;
+            const idx = Array.from(blockquote.querySelectorAll('a')).indexOf(
+              target
+            );
+            const matches = blockquote.innerText.match(
+              new RegExp('「(.*?)」', 'g')
+            );
+            let query = matches && matches[idx];
+            if (!query) return;
+            query = query.replace(/「|」/g, '').trim();
+            this.showSearchRes(query);
+          },
+
+          // 展示搜索结果
+          async showSearchRes(query) {
+            const searchRes = this.getSearchRes(query);
+            if (!searchRes) {
+              this.searchRes = null;
+              return;
+            } else {
+              this.searchRes = searchRes;
+            }
+            await this.$nextTick();
+            const template = this.$refs.searchResTemplate;
+            if (!template) return;
+            const htmlContent = template.innerHTML;
+            // 显示弹窗
+            this.showSwal({
+              title: '联网搜索详情',
+              html: htmlContent,
+              width: this.isMobile ? '95%' : '800px',
+              showConfirmButton: true,
+              confirmButtonText: '&nbsp;关闭&nbsp;',
+              showCancelButton: false,
+              reverseButtons: true,
+              customClass: {
+                popup: 'search-results-popup',
+                htmlContainer: 'search-results-content'
+              }
+            });
+          },
+
+          async shareSession() {
+            const sessionContent = document.querySelector('.session-content');
+            if (!sessionContent) {
+              this.showSwal({
+                title: '截图失败',
+                text: '未找到要截图的内容',
+                icon: 'error',
+                confirmButtonText: '确定'
+              });
+              return;
+            }
+            this.isCapturing = true;
+            await this.$nextTick();
+
+            // 显示加载提示
+            this.showSwal({
+              title: '正在生成截图...',
+              allowOutsideClick: false,
+              didOpen: () => {
+                Swal.showLoading();
+              }
+            });
+
+            // 使用html2canvas截图
+            html2canvas(sessionContent, {
+              backgroundColor: '#ffffff',
+              scale: window.devicePixelRatio || 1,
+              useCORS: true,
+              allowTaint: false,
+              logging: false,
+              height: null,
+              width: null
+            })
+              .then(canvas => {
+                // 检测是否为微信浏览器环境
+                const userAgent = navigator.userAgent.toLowerCase();
+                const isWechat =
+                  userAgent.includes('micromessenger') &&
+                  userAgent.includes('mobile');
+                const isMobile = this.isMobile;
+                const imageDataUrl = canvas.toDataURL('image/png');
+                this.showSwal({
+                  title: isMobile ? '长按保存图片' : '右键复制图片',
+                  html:
+                    '<div style="max-height: 70vh; overflow-y: auto;"><img src="' +
+                    imageDataUrl +
+                    '" style="max-width: 100%; height: auto; border-radius: 8px;" /></div>',
+                  showConfirmButton: true,
+                  confirmButtonText: '&nbsp;下载&nbsp;',
+                  showCancelButton: true,
+                  cancelButtonText: '&nbsp;关闭&nbsp;',
+                  width: isMobile ? '95%' : 'auto',
+                  padding: '0.25em 0 1em',
+                  customClass: {
+                    htmlContainer: 'swal-image-container'
+                  }
+                }).then(result => {
+                  // 如果点击了确认按钮（显示为"下载"）
+                  if (result.isConfirmed) {
+                    const link = document.createElement('a');
+                    const regex = new RegExp('[\/\: ]', 'g');
+                    link.download =
+                      'openai-chat-' +
+                      new Date().toLocaleString().replace(regex, '-') +
+                      '.png';
+                    link.href = imageDataUrl;
+
+                    // 触发下载
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
+
+                    // 显示下载成功提示
+                    this.showSwal({
+                      title: '下载成功',
+                      text: '图片已保存到下载文件夹',
+                      icon: 'success',
+                      timer: 2000,
+                      showConfirmButton: false
+                    });
+                  }
+                });
+              })
+              .catch(error => {
+                console.error('截图失败:', error);
+                this.showSwal({
+                  title: '截图失败',
+                  text: '生成图片时出现错误: ' + error.message,
+                  icon: 'error',
+                  confirmButtonText: '确定'
+                });
+              })
+              .finally(() => {
+                this.isCapturing = false;
+              });
+          },
+
+          updateSessionTitle() {
+            if (this.currentSession && this.currentSession.question) {
+              this.currentSession.title =
+                this.currentSession.question.slice(0, 30) +
+                (this.currentSession.question.length > 30 ? '...' : '');
+            }
+          },
+
+          getModelName(value) {
+            const model = this.availableModels.find(i => i.value === value);
+            if (model) {
+              return model.label;
+            } else {
+              return value;
+            }
+          },
+
+          async sendMessage() {
+            if (
+              (!this.messageInput.trim() && this.uploadedImages.length === 0) ||
+              !this.apiKey
+            )
+              return;
+            if (this.isLoading || this.isStreaming || this.isUploadingImage)
+              return;
+
+            // 如果当前会话已有回答，创建新会话
+            if (this.currentSession && this.currentSession.answer2) {
+              this.createNewSession();
+              return;
+            }
+
+            this.errorMessage = '';
+            const userMessage = this.messageInput
+              .trim()
+              .replace(new RegExp('<', 'g'), '&lt;');
+
+            // 处理图片:如果不支持URL,转为base64;否则使用URL
+            const userImages = [];
+            const userImagesForSending = []; // 用于发送API的图片数组
+            for (const img of this.uploadedImages) {
+              if (img.url) {
+                // 有URL,使用URL
+                userImages.push(img.url);
+                userImagesForSending.push(img.url);
+              } else if (img.file) {
+                // 没有URL,需要转base64发送,但session中保存INVALID
+                userImages.push('INVALID');
+                const base64 = await this.fileToBase64(img.file);
+                userImagesForSending.push(base64);
+              }
+            }
+
+            this.clearInput();
+            this.clearUploadedImages(); // 清空上传的图片
+            // 清空当前会话的草稿
+            if (this.currentSession) {
+              this.currentSession.draft = '';
+            }
+
+            // 添加用户消息
+            if (!this.currentSession) {
+              this.createNewSession();
+            }
+            const session = this.currentSession;
+            session.role = this.getRolePrompt();
+
+            // 判断是第一轮or第二轮问答
+            if (!session.answer) {
+              session.createdAt = new Date().toISOString();
+              session.model = this.selectedModel;
+              session.question = userMessage;
+              session.images = userImages;
+              session.answer = '';
+              session.question2 = '';
+              session.answer2 = '';
+              session.images2 = [];
+              this.autoFoldRolePrompt();
+            } else {
+              session.createdAt2 = new Date().toISOString();
+              session.model2 = this.selectedModel;
+              session.question2 = userMessage;
+              session.images2 = userImages;
+              session.answer2 = '';
+            }
+            this.updateSessionTitle();
+            this.saveData();
+            this.scrollToBottom();
+
+            // 发送到 OpenAI API (流式)
+            const messages = [];
+            this.isLoading = true;
+            this.isStreaming = false;
+            this.isSentForAWhile = false;
+            this.sleep(2500).then(() => {
+              this.isSentForAWhile = true;
+            });
+            this.streamingContent = '';
+            this.abortController = new AbortController();
+
+            // 组装messages - OpenAI格式
+            if (this.getRolePrompt()) {
+              const needAssistant = /claude|gpt5/i.test(this.selectedModel);
+              messages.push({
+                role: !needAssistant ? 'system' : 'assistant',
+                content: this.globalRolePrompt.trim()
+              });
+            }
+
+            // 添加对话历史
+            if (session.question) {
+              const content = [];
+
+              // 添加文本内容
+              if (session.question.trim()) {
+                content.push({
+                  type: 'text',
+                  text: session.question
+                });
+              }
+
+              // 添加图片内容(如果是当前问题使用userImagesForSending,否则使用session保存的)
+              const isCurrentQuestion = !session.answer;
+              const imagesToUse = isCurrentQuestion
+                ? userImagesForSending
+                : session.images;
+
+              if (imagesToUse && imagesToUse.length > 0) {
+                imagesToUse.forEach(imageUrl => {
+                  // 跳过INVALID标记
+                  if (imageUrl !== 'INVALID') {
+                    content.push({
+                      type: 'image_url',
+                      image_url: {
+                        url: imageUrl
+                      }
+                    });
+                  }
+                });
+              }
+
+              messages.push({
+                role: 'user',
+                content:
+                  content.length === 1 && content[0].type === 'text'
+                    ? content[0].text
+                    : content
+              });
+            }
+            if (session.answer) {
+              messages.push({
+                role: 'assistant',
+                content: session.answer
+              });
+            }
+            if (session.question2) {
+              const content = [];
+
+              // 添加文本内容
+              if (session.question2.trim()) {
+                content.push({
+                  type: 'text',
+                  text: session.question2
+                });
+              }
+
+              // 添加图片内容(如果是当前问题使用userImagesForSending,否则使用session保存的)
+              const isCurrentQuestion = !session.answer2;
+              const imagesToUse = isCurrentQuestion
+                ? userImagesForSending
+                : session.images2;
+
+              if (imagesToUse && imagesToUse.length > 0) {
+                imagesToUse.forEach(imageUrl => {
+                  // 跳过INVALID标记
+                  if (imageUrl !== 'INVALID') {
+                    content.push({
+                      type: 'image_url',
+                      image_url: {
+                        url: imageUrl
+                      }
+                    });
+                  }
+                });
+              }
+
+              messages.push({
+                role: 'user',
+                content:
+                  content.length === 1 && content[0].type === 'text'
+                    ? content[0].text
+                    : content
+              });
+            }
+
+            // 这里根据最新的问句, 调用/search接口查询语料
+            let searchQueries = [];
+            let searchCounts = [];
+            if (this.needSearch) {
+              let query = session.question2 || session.question;
+              if (session.question2) {
+                query +=
+                  '\\n\\n当前会话摘要：“' + (session.summary || '') + '”';
+              }
+              let searchResList = await fetch('/search', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Authorization: 'Bearer ' + this.apiKey
+                },
+                body: JSON.stringify({ query })
+              })
+                .then(res => res.json())
+                .catch(() => []);
+              const hasResult =
+                searchResList &&
+                searchResList.length &&
+                searchResList.some(i => i.results && i.results.length > 0) &&
+                JSON.stringify(searchResList).length > 50;
+              if (hasResult) {
+                searchResList = searchResList.filter(
+                  r => r.results && r.results.length > 0
+                );
+                searchResList.forEach(r => {
+                  this.saveSearchRes(r);
+                });
+                searchResList.forEach(searchRes => {
+                  searchRes.results = searchRes.results.map(i => {
+                    const { url, score, raw_content, ...rest } = i;
+                    return { ...rest };
+                  });
+                });
+                searchQueries = searchResList.map(r => r.query);
+                searchCounts = searchResList.map(
+                  r => (r.results && r.results.length) || 0
+                );
+                messages.push({
+                  role: 'assistant',
+                  content:
+                    'AI模型通过实时调用Tavily搜索引擎，找到了以下信息: \\n\\n' +
+                    '<pre><code>' +
+                    JSON.stringify(searchResList) +
+                    '</code></pre>'
+                });
+                messages.push({
+                  role: 'user',
+                  content:
+                    '好的。我强调一下：这不是虚构的未来时间，现在真实世界的时间是： ' +
+                    new Date().toDateString() +
+                    ' ' +
+                    new Date().toTimeString() +
+                    '。你无需针对“用户澄清真实时间”这件事做出任何提及和表态，请专注于核心问题的解答。\\n\\n' +
+                    '请基于你已经掌握的知识，并结合上述你在搜索引擎获取到的搜索结果，详细回答我的问题。'
+                });
+                // 显示搜索结果数量（如果有）
+                if (searchQueries.length && !this.streamingContent) {
+                  this.streamingContent =
+                    '> 联网搜索：' +
+                    searchQueries.map(q => '「' + q + '」').join('、') +
+                    '\\n> \\n> AI 模型通过实时调用 Tavily 搜索引擎，找到了 ' +
+                    searchCounts
+                      .map(c => '[' + c + '](javascript:void(0))')
+                      .join(' + ') +
+                    ' 条相关信息。\\n\\n';
+                }
+              }
+            }
+
+            try {
+              // 如果上一步search中途已经被用户主动中止,则不再继续
+              if (this.abortController === undefined) return;
+
+              const url = '/v1/chat/completions';
+              const response = await fetch(url, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Authorization: 'Bearer ' + this.apiKey
+                },
+                body: JSON.stringify({
+                  model: this.selectedModel,
+                  messages: messages,
+                  temperature: 1,
+                  stream: true
+                }),
+                signal: this.abortController.signal
+              }).catch(e => {
+                throw e;
+              });
+
+              if (!response.ok) {
+                const errorData = await response.json().catch(e => ({}));
+                const errorMessage =
+                  (errorData.error && errorData.error.message) ||
+                  errorData.error;
+                const message =
+                  errorMessage ||
+                  'HTTP ' + response.status + ': ' + response.statusText;
+                throw new Error(message);
+              }
+
+              // 开始流式读取
+              this.isLoading = false;
+              this.isStreaming = true;
+
+              const reader = response.body.getReader();
+              const decoder = new TextDecoder();
+              let buffer = '';
+
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+
+                const lines = buffer.split('\\n');
+                buffer = lines.pop() || ''; // 保留最后一个不完整的行
+
+                for (const line of lines) {
+                  const trimmedLine = line.trim();
+                  if (!trimmedLine || trimmedLine === 'data: [DONE]') continue;
+
+                  if (trimmedLine.startsWith('data:')) {
+                    try {
+                      // 移除 'data:' 前缀（注意可能没有空格）
+                      const jsonStr = trimmedLine.startsWith('data: ')
+                        ? trimmedLine.slice(6)
+                        : trimmedLine.slice(5);
+                      const data = JSON.parse(jsonStr);
+
+                      if (data.choices && data.choices[0].delta.content) {
+                        let delta = data.choices[0].delta.content;
+                        const regThinkStart = new RegExp('<think>');
+                        const regThinkEnd = new RegExp('</think>');
+                        delta = delta
+                          .replace(
+                            regThinkStart,
+                            '<blockquote style="font-size: 0.75em">'
+                          )
+                          .replace(regThinkEnd, '</blockquote>\\n');
+                        if (delta) {
+                          const shouldScroll = !this.streamingContent;
+                          this.streamingContent += delta;
+                          if (shouldScroll) {
+                            this.scrollToBottom();
+                          }
+                        }
+                      }
+                    } catch (parseError) {
+                      console.warn(
+                        '解析 SSE 数据失败:',
+                        parseError,
+                        'Line:',
+                        trimmedLine
+                      );
+                    }
+                  }
+                }
+              }
+
+              // 流式完成
+              const answerKey = session.question2 ? 'answer2' : 'answer';
+              this.currentSession[answerKey] = this.streamingContent;
+              this.saveData();
+            } catch (error) {
+              console.error('Error:', error);
+              if (error.name === 'AbortError') {
+                this.errorMessage = '请求已取消';
+              } else {
+                this.errorMessage = '发送失败: ' + error.message;
+                // 显示错误提示
+                this.showSwal({
+                  title: '发送失败',
+                  text: error.message,
+                  icon: 'error',
+                  confirmButtonText: '确定'
+                });
+              }
+              const answerKey = session.question2 ? 'answer2' : 'answer';
+              this.currentSession[answerKey] = this.streamingContent;
+              this.saveData();
+            } finally {
+              this.isLoading = false;
+              this.isStreaming = false;
+              this.streamingContent = '';
+              this.abortController = null;
+              this.generateSessionSummary();
+              // this.scrollToBottom();
+            }
+          },
+
+          // 保存tavily的搜索结果,用于后续回显
+          saveSearchRes(res) {
+            const KEY = 'openai_search_results';
+            const query = res && res.query;
+            if (!query) return;
+            if (!res.results || res.results.length === 0) return;
+            let cache = localStorage.getItem(KEY);
+            if (cache) {
+              try {
+                cache = JSON.parse(cache);
+              } catch (e) {
+                cache = [];
+              }
+            } else {
+              cache = [];
+            }
+            const idx = cache.findIndex(i => i.query === query);
+            if (idx >= 0) {
+              cache.splice(idx, 1, res);
+            } else {
+              cache.unshift(res);
+              cache = cache.slice(0, 30);
+            }
+            localStorage.setItem(KEY, JSON.stringify(cache));
+          },
+
+          // 根据query找到cache中缓存的搜索结果
+          getSearchRes(query) {
+            if (!query) return null;
+            const KEY = 'openai_search_results';
+            let cache = localStorage.getItem(KEY);
+            if (cache) {
+              try {
+                cache = JSON.parse(cache);
+              } catch (e) {
+                cache = [];
+              }
+            } else {
+              cache = [];
+            }
+            const res = cache.find(i => i.query === query);
+            return res || null;
+          },
+
+          // 编辑已经问过的问题
+          editQuestion() {
+            if (this.isLoading || this.isStreaming || this.isUploadingImage)
+              return;
+            if (!this.currentSession) return;
+            // 二次确认
+            this.showSwal({
+              title: '确认编辑问题',
+              text: '这会导致对应的回答被清空，您确定要编辑这个问题吗？',
+              icon: 'warning',
+              showCancelButton: true,
+              confirmButtonText: '确定',
+              confirmButtonColor: '#d33',
+              cancelButtonText: '取消',
+              reverseButtons: true
+            }).then(result => {
+              if (!result.isConfirmed) return;
+              const session = this.currentSession;
+              const questionText = session.question2 || session.question || '';
+              if (session.question2) {
+                this.uploadedImages = (session.images2 || [])
+                  .filter(i => i && i !== 'INVALID')
+                  .map(i => ({
+                    url: i
+                  }));
+
+                session.question2 = '';
+                session.images2 = [];
+                session.createdAt2 = '';
+                session.model2 = '';
+                session.answer2 = '';
+              } else {
+                this.uploadedImages = (session.images || [])
+                  .filter(i => i && i !== 'INVALID')
+                  .map(i => ({
+                    url: i
+                  }));
+                session.question = '';
+                session.images = [];
+                session.createdAt = '';
+                session.model = '';
+                session.answer = '';
+                session.title = '新会话';
+                session.summary = '';
+              }
+              session.draft = questionText;
+              this.messageInput = questionText;
+              session.role = this.getRolePrompt();
+              this.saveData();
+            });
+          },
+
+          // 删除最新的回答并重新回答
+          regenerateAnswer() {
+            // 二次确认
+            this.showSwal({
+              title: '确认删除回答',
+              text: '确定要删除这个回答并重新生成吗？',
+              icon: 'warning',
+              showCancelButton: true,
+              confirmButtonText: '确定',
+              confirmButtonColor: '#d33',
+              cancelButtonText: '取消',
+              reverseButtons: true
+            }).then(result => {
+              if (!result.isConfirmed) return;
+              if (this.isLoading || this.isStreaming || this.isUploadingImage)
+                return;
+              if (!this.currentSession || !this.currentSession.answer) return;
+              // 如果是第二轮问答，删除第二轮回答
+              if (this.currentSession.answer2) {
+                this.currentSession.answer2 = '';
+                this.currentSession.createdAt2 = '';
+                this.currentSession.model2 = '';
+                this.messageInput = this.currentSession.question2 || '';
+                this.currentSession.question2 = '';
+                this.currentSession.images2 = [];
+              } else {
+                // 如果是第一轮问答，删除第一轮回答
+                this.currentSession.answer = '';
+                this.currentSession.createdAt = '';
+                this.currentSession.model = '';
+                this.messageInput = this.currentSession.question || '';
+                this.currentSession.question = '';
+                this.currentSession.images = [];
+              }
+              this.saveData();
+              this.sendMessage();
+            });
+          },
+
+          // 重新发送当前问题（用于API错误后的重试）
+          retryCurrentQuestion() {
+            if (this.isLoading || this.isStreaming || this.isUploadingImage)
+              return;
+            const session = this.currentSession;
+            if (!session) return;
+
+            // 清除错误消息
+            this.errorMessage = '';
+
+            // 判断是第一轮还是第二轮问答
+            if (session.question && !session.answer) {
+              // 第一轮问答失败，重新发送
+              this.messageInput = session.question || '';
+              this.uploadedImages = (session.images || [])
+                .filter(i => i && i !== 'INVALID')
+                .map(i => ({ url: i }));
+
+              // 清空问题，让sendMessage重新设置
+              session.question = '';
+              session.images = [];
+              session.createdAt = '';
+              session.model = '';
+
+              this.sendMessage();
+            } else if (session.question2 && !session.answer2) {
+              // 第二轮问答失败，重新发送
+              this.messageInput = session.question2 || '';
+              this.uploadedImages = (session.images2 || [])
+                .filter(i => i && i !== 'INVALID')
+                .map(i => ({ url: i }));
+
+              // 清空问题，让sendMessage重新设置
+              session.question2 = '';
+              session.images2 = [];
+              session.createdAt2 = '';
+              session.model2 = '';
+
+              this.sendMessage();
+            }
+          },
+
+          // 生成会话摘要
+          async generateSessionSummary() {
+            const session = this.currentSession;
+            if (!session || !session.question || !session.answer) return;
+            if (session.summary && session.question2) return;
+            const { id, question, answer } = session;
+
+            await this.sleep(150);
+
+            fetch('/summarize', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: 'Bearer ' + this.apiKey
+              },
+              body: JSON.stringify({
+                question: question,
+                answer: answer
+              })
+            })
+              .then(response => {
+                if (!response.ok) {
+                  throw new Error(
+                    'HTTP ' + response.status + ': ' + response.statusText
+                  );
+                }
+                return response.json();
+              })
+              .then(async data => {
+                if (data.success && data.summary) {
+                  let summary = data.summary.trim();
+                  const item = this.sessions.find(s => s.id === id);
+                  if (item) {
+                    // 移除结尾的标点符号
+                    if (
+                      summary.endsWith('。') ||
+                      summary.endsWith('！') ||
+                      summary.endsWith('？')
+                    ) {
+                      summary = summary.slice(0, -1);
+                    }
+                    item.summary = summary;
+                    this.sleep(1000).then(() => {
+                      this.saveData();
+                    });
+                  }
+                } else {
+                  throw new Error('未能生成摘要');
+                }
+              })
+              .catch(error => {
+                console.error('生成摘要失败:', error);
+              });
+          },
+
+          // 根据全局角色设定的字符长度决定是否折叠
+          autoFoldRolePrompt() {
+            const len = (
+              (this.currentSession && this.currentSession.role) ||
+              ''
+            ).length;
+            if (len > 150) {
+              this.isFoldRole = true;
+            } else {
+              this.isFoldRole = false;
+            }
+          },
+
+          handleKeyDown(event) {
+            if (this.isPC && event.key === 'Enter' && !event.shiftKey) {
+              event.preventDefault();
+              this.sendMessage();
+            }
+          },
+
+          autoResizeTextarea() {
+            this.$nextTick(() => {
+              const textarea = this.$refs.messageInputRef;
+              if (textarea) {
+                textarea.style.height = 'auto';
+                textarea.style.height =
+                  Math.min(textarea.scrollHeight, 144) + 'px';
+              }
+            });
+          },
+
+          scrollToTop() {
+            this.$nextTick(() => {
+              const container = this.$refs.messagesContainer;
+              if (container) {
+                container.scrollTop = 0;
+              }
+            });
+          },
+
+          scrollToBottom() {
+            this.$nextTick(() => {
+              const container = this.$refs.messagesContainer;
+              if (container) {
+                container.scrollTop = container.scrollHeight;
+              }
+            });
+          },
+
+          // 如果当前已经滑动到底部，则保持在底部
+          async stickToBottom() {
+            await this.$nextTick();
+            const vh = window.innerHeight;
+            const container = this.$refs.messagesContainer;
+            if (!container) return;
+            // 如果当前容器滚动高度低于1.15倍window.innerHeight, 强制滚动到底部
+            if (container.scrollHeight < vh * 1.15) {
+              container.scrollTop = container.scrollHeight;
+              return;
+            }
+            const isAtBottom =
+              container.scrollHeight - container.scrollTop <=
+              container.clientHeight + vh * 0.2;
+            if (isAtBottom) {
+              container.scrollTop = container.scrollHeight;
+            }
+          },
+
+          // 清空输入框
+          clearInput() {
+            this.messageInput = '';
+            this.saveDraftToCurrentSession();
+          },
+
+          // 输入变化时的处理
+          onInputChange() {
+            this.saveDraftToCurrentSession();
+          },
+
+          // 保存草稿到当前会话
+          saveDraftToCurrentSession() {
+            if (this.currentSession) {
+              this.currentSession.draft = this.messageInput;
+              this.saveData();
+            }
+          },
+
+          // 从当前会话加载草稿
+          loadDraftFromCurrentSession() {
+            if (this.currentSession) {
+              this.messageInput = (this.currentSession.draft || '').trim();
+            } else {
+              this.messageInput = '';
+            }
+          },
+
+          // 显示关于信息
+          showAbout() {
+            const isMobile = this.isMobile;
+            const template = this.$refs.aboutTemplate;
+            if (!template) return;
+            const htmlContent = template.innerHTML;
+            this.showSwal({
+              title: '关于 OpenAI WebUI Lite',
+              confirmButtonText: '&emsp;知道了&emsp;',
+              width: isMobile ? '95%' : '600px',
+              html: htmlContent
+            });
+          }
+        }
+      }).mount('#app');
+    </script>
+  </body>
+</html>
+
+  `;
+  html = html.replace(`'$MODELS_PLACEHOLDER$'`, `'${modelIds}'`);
+  // 控制"联网搜索"复选框的显隐
+  if (!tavilyKeys) {
+    html = html.replace(`"model-search-label"`, `"hidden"`);
+  }
+  // 替换网页标题
+  if (title) {
+    const regex = new RegExp(TITLE_DEFAULT, 'g');
+    html = html.replace(regex, title);
+  }
+  // 如果模型<=10个, 则不必引入tom-select.js
+  if (modelIds.split(',').length <= 10) {
+    html = html.replace(
+      /<script[\s]*src="https:\/\/unpkg\.com\/tom-select[\s\S]{0,80}?\/script>/,
+      ''
+    );
+    html = html.replace(
+      /<link[\s]*href="https:\/\/unpkg\.com\/tom-select[\s\S]{0,80}?\/>/,
+      ''
+    );
+  }
+  return html;
+}
